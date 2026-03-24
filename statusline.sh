@@ -6,11 +6,50 @@
 # ─────────────────────────────────────────
 #
 # Environment variables:
-#   OBSIDIAN_VAULT          — Path to your Obsidian vault (optional, enables logging)
-#   ANTHROPIC_ADMIN_API_KEY — Anthropic Admin API key (optional, enables API spend tracking)
+#   OBSIDIAN_VAULT              — Path to your Obsidian vault (optional, enables logging)
+#   ANTHROPIC_ADMIN_API_KEY     — Anthropic Admin API key (optional, enables API spend tracking)
+#   ANTHROPIC_BILLING_START_DAY — Day of month your billing cycle starts (default: 01)
+#   CLAUDE_STATUSLINE_DEBUG     — Set to 1 to log diagnostics to ~/.claude/.statusline_debug.log
 #
 # Context rot thresholds based on Claude Opus 4.6 Context Management Spec v1.0:
 #   0-50%: Healthy | 50-75%: Attention | 75-90%: Checkpoint | 90-95%: Critical | 95%+: Emergency
+
+# ── Debug helper ──
+DEBUG_LOG="$HOME/.claude/.statusline_debug.log"
+debug() { [ -n "$CLAUDE_STATUSLINE_DEBUG" ] && echo "[$(date -u +%H:%M:%S)] $*" >> "$DEBUG_LOG"; }
+
+# ── Test mode: bash statusline.sh --test-api ──
+if [ "${1}" = "--test-api" ]; then
+  if [ -z "$ANTHROPIC_ADMIN_API_KEY" ]; then
+    echo "ERROR: ANTHROPIC_ADMIN_API_KEY is not set"; exit 1
+  fi
+  BILLING_DAY="${ANTHROPIC_BILLING_START_DAY:-01}"
+  START_DATE=$(date -u +"%Y-%m-${BILLING_DAY}T00:00:00Z")
+  END_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  echo "Fetching cost report: $START_DATE → $END_DATE"
+  TOTAL_CENTS=0; PAGE=""; PAGE_NUM=0
+  while true; do
+    PAGE_PARAM=""; [ -n "$PAGE" ] && PAGE_PARAM="&page=${PAGE}"
+    RESPONSE=$(curl -sf --max-time 10 \
+      "https://api.anthropic.com/v1/organizations/cost_report?starting_at=${START_DATE}&ending_at=${END_DATE}&bucket_width=1d&limit=31${PAGE_PARAM}" \
+      --header "anthropic-version: 2023-06-01" \
+      --header "x-api-key: $ANTHROPIC_ADMIN_API_KEY")
+    [ $? -ne 0 ] && echo "ERROR: curl failed on page $((PAGE_NUM+1))" && exit 1
+    ERROR=$(echo "$RESPONSE" | jq -r '.error.message // empty' 2>/dev/null)
+    [ -n "$ERROR" ] && echo "API ERROR: $ERROR" && exit 1
+    PAGE_NUM=$((PAGE_NUM + 1))
+    PAGE_CENTS=$(echo "$RESPONSE" | jq '[.data[].results[]?.amount // "0" | tonumber] | add // 0' 2>/dev/null)
+    echo "  Page $PAGE_NUM: $PAGE_CENTS cents"
+    TOTAL_CENTS=$(echo "$TOTAL_CENTS + $PAGE_CENTS" | bc -l)
+    HAS_MORE=$(echo "$RESPONSE" | jq -r '.has_more // false' 2>/dev/null)
+    [ "$HAS_MORE" != "true" ] && break
+    PAGE=$(echo "$RESPONSE" | jq -r '.next_page // empty' 2>/dev/null)
+    [ -z "$PAGE" ] && break
+  done
+  TOTAL=$(echo "$TOTAL_CENTS" | awk '{printf "%.2f", $1 / 100}')
+  echo "Total: \$$TOTAL (from $PAGE_NUM page(s), $TOTAL_CENTS cents raw)"
+  exit 0
+fi
 
 input=$(cat)
 
@@ -57,21 +96,53 @@ API_COST_AGE=$(find "$API_COST_CACHE" -mmin +5 2>/dev/null | wc -l)
 
 if [ ! -f "$API_COST_CACHE" ] || [ "$API_COST_AGE" -gt 0 ]; then
   if [ -n "$ANTHROPIC_ADMIN_API_KEY" ]; then
-    START_DATE=$(date -u +"%Y-%m-01T00:00:00Z")
+    BILLING_DAY="${ANTHROPIC_BILLING_START_DAY:-01}"
+    START_DATE=$(date -u +"%Y-%m-${BILLING_DAY}T00:00:00Z")
     END_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    API_COST_RAW=$(curl -s \
-      "https://api.anthropic.com/v1/organizations/cost_report?starting_at=${START_DATE}&ending_at=${END_DATE}" \
-      --header "anthropic-version: 2023-06-01" \
-      --header "x-api-key: $ANTHROPIC_ADMIN_API_KEY" 2>/dev/null)
+    debug "Fetching cost report: $START_DATE → $END_DATE"
 
-    # API returns cents — divide by 100 to get dollars
-    API_TOTAL=$(echo "$API_COST_RAW" | jq -r '
-      [.data[].results[]?.amount // "0"] | map(tonumber) | add // 0
-    ' 2>/dev/null | awk '{printf "%.2f", $1 / 100}')
+    # Paginate until has_more is false — API returns one bucket per day
+    TOTAL_CENTS=0; PAGE=""; PAGE_NUM=0; FETCH_OK=false
+    while true; do
+      PAGE_PARAM=""; [ -n "$PAGE" ] && PAGE_PARAM="&page=${PAGE}"
+      RESPONSE=$(curl -sf --max-time 10 \
+        "https://api.anthropic.com/v1/organizations/cost_report?starting_at=${START_DATE}&ending_at=${END_DATE}&bucket_width=1d&limit=31${PAGE_PARAM}" \
+        --header "anthropic-version: 2023-06-01" \
+        --header "x-api-key: $ANTHROPIC_ADMIN_API_KEY" 2>/dev/null)
+      CURL_EXIT=$?
+      debug "Page $((PAGE_NUM+1)) curl exit=$CURL_EXIT response_len=${#RESPONSE}"
 
-    echo "${API_TOTAL:-0.00}" > "$API_COST_CACHE"
+      # Abort on curl failure or API error — keep old cache value
+      if [ "$CURL_EXIT" -ne 0 ] || [ -z "$RESPONSE" ]; then
+        debug "curl failed, keeping stale cache"
+        break
+      fi
+      ERROR=$(echo "$RESPONSE" | jq -r '.error.message // empty' 2>/dev/null)
+      if [ -n "$ERROR" ]; then
+        debug "API error: $ERROR"
+        break
+      fi
+
+      PAGE_NUM=$((PAGE_NUM + 1))
+      FETCH_OK=true
+      PAGE_CENTS=$(echo "$RESPONSE" | jq '[.data[].results[]?.amount // "0" | tonumber] | add // 0' 2>/dev/null)
+      debug "Page $PAGE_NUM: $PAGE_CENTS cents"
+      TOTAL_CENTS=$(echo "$TOTAL_CENTS + ${PAGE_CENTS:-0}" | bc -l)
+
+      HAS_MORE=$(echo "$RESPONSE" | jq -r '.has_more // false' 2>/dev/null)
+      [ "$HAS_MORE" != "true" ] && break
+      PAGE=$(echo "$RESPONSE" | jq -r '.next_page // empty' 2>/dev/null)
+      [ -z "$PAGE" ] && break
+    done
+
+    # Only update cache on a successful fetch — never overwrite with failure
+    if [ "$FETCH_OK" = "true" ]; then
+      API_TOTAL=$(echo "$TOTAL_CENTS" | awk '{printf "%.2f", $1 / 100}')
+      debug "Total: \$$API_TOTAL ($PAGE_NUM pages, $TOTAL_CENTS cents)"
+      echo "$API_TOTAL" > "$API_COST_CACHE"
+    fi
   else
-    # Fallback: accumulate session costs locally if no Admin API key
+    # Fallback: read locally accumulated session costs if no Admin API key
     LOCAL_LOG="$HOME/.claude/.session_cost_total"
     PREV_TOTAL=$(cat "$LOCAL_LOG" 2>/dev/null || echo "0")
     echo "$PREV_TOTAL" > "$API_COST_CACHE"

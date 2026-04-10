@@ -31,17 +31,13 @@ if ! command -v gh &>/dev/null; then
   MISSING+=("gh (GitHub CLI)")
 fi
 
-if ! command -v bc &>/dev/null; then
-  MISSING+=("bc")
-fi
-
 if [ ${#MISSING[@]} -gt 0 ]; then
   echo -e "${YELLOW}Missing dependencies:${NC}"
   for dep in "${MISSING[@]}"; do
     echo -e "  ${RED}✗${NC} $dep"
   done
   echo ""
-  echo -e "Install with: ${CYAN}brew install jq gh${NC} (macOS) or ${CYAN}apt install jq gh bc${NC} (Linux)"
+  echo -e "Install with: ${CYAN}brew install jq gh${NC} (macOS) or ${CYAN}apt install jq gh${NC} (Linux)"
   echo ""
   read -p "Continue anyway? (y/N) " -n 1 -r
   echo ""

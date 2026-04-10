@@ -18,6 +18,10 @@
 DEBUG_LOG="$HOME/.claude/.statusline_debug.log"
 debug() { [ -n "$CLAUDE_STATUSLINE_DEBUG" ] && echo "[$(date -u +%H:%M:%S)] $*" >> "$DEBUG_LOG"; }
 
+# ── Float comparison helpers (replaces bc dependency) ──
+_gt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
+_ge() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'; }
+
 # ── Test mode: bash statusline.sh --test-api ──
 if [ "${1}" = "--test-api" ]; then
   if [ -z "$ANTHROPIC_ADMIN_API_KEY" ]; then
@@ -40,7 +44,7 @@ if [ "${1}" = "--test-api" ]; then
     PAGE_NUM=$((PAGE_NUM + 1))
     PAGE_CENTS=$(echo "$RESPONSE" | jq '[.data[].results[]?.amount // "0" | tonumber] | add // 0' 2>/dev/null)
     echo "  Page $PAGE_NUM: $PAGE_CENTS cents"
-    TOTAL_CENTS=$(echo "$TOTAL_CENTS + $PAGE_CENTS" | bc -l)
+    TOTAL_CENTS=$(awk -v a="$TOTAL_CENTS" -v b="${PAGE_CENTS:-0}" 'BEGIN{print a+b}')
     HAS_MORE=$(echo "$RESPONSE" | jq -r '.has_more // false' 2>/dev/null)
     [ "$HAS_MORE" != "true" ] && break
     PAGE=$(echo "$RESPONSE" | jq -r '.next_page // empty' 2>/dev/null)
@@ -78,21 +82,36 @@ USED_TOKENS=$(echo "$input" | jq -r '
 ')
 
 # ── Cost per 1k tokens (real-time) ──
-if [ "$USED_TOKENS" -gt 0 ] && [ "$(echo "$SESSION_COST > 0" | bc -l 2>/dev/null)" = "1" ]; then
+if [ "$USED_TOKENS" -gt 0 ] && _gt "${SESSION_COST:-0}" 0; then
   COST_PER_1K=$(echo "$SESSION_COST $USED_TOKENS" | awk '{printf "%.4f", ($1 / $2) * 1000}')
 else
   COST_PER_1K="0.0000"
 fi
 
 SESSION_COST_FMT=$(printf "%.4f" "$SESSION_COST")
-TOKEN_DISPLAY=$(echo "$USED_TOKENS" | awk '{printf "%dk", $1/1000}')
+SESSION_COST_SHORT=$(printf "%.2f" "$SESSION_COST")
+
+# ── Token display with smart precision (e.g. 1.2k not 1k for <10k) ──
+TOKEN_DISPLAY=$(echo "$USED_TOKENS" | awk '{
+  v = $1/1000;
+  if (v < 10) printf "%.1fk", v;
+  else printf "%dk", v;
+}')
 
 # ── Context window size in k ──
 CTX_LIMIT_K=$(echo "$CTX_SIZE" | awk '{printf "%dk", $1/1000}')
 
+# ── Session cost alert thresholds ──
+COST_ALERT=""
+if _ge "${SESSION_COST:-0}" 5; then
+  COST_ALERT="\033[41;37;1m ⚠ \$${SESSION_COST_FMT} BURN \033[0m"
+elif _ge "${SESSION_COST:-0}" 3; then
+  COST_ALERT="\033[31m ⚠ \$${SESSION_COST_FMT}\033[0m"
+fi
+
 # ── GitHub username (cached 60 min) ──
 GH_CACHE="$HOME/.claude/.gh_user_cache"
-if [ ! -f "$GH_CACHE" ] || [ $(find "$GH_CACHE" -mmin +60 2>/dev/null | wc -l) -gt 0 ]; then
+if [ ! -f "$GH_CACHE" ] || [ "$(find "$GH_CACHE" -mmin +60 2>/dev/null | wc -l)" -gt 0 ]; then
   GH_USER=$(gh api user --jq '.login' 2>/dev/null || echo "")
   echo "$GH_USER" > "$GH_CACHE"
 else
@@ -107,9 +126,9 @@ CC_BILLING_MONTH_FILE="$HOME/.claude/.cc_billing_month"
 BILLING_DAY="${ANTHROPIC_BILLING_START_DAY:-01}"
 
 CURRENT_YYYYMM=$(date +%Y%m)
-CURRENT_DAY=$((10#$(date +%d)))
+CURRENT_DAY=$(date +%-d 2>/dev/null || date +%d | sed 's/^0//')
 # If we haven't reached the billing day this month, billing period is still "last month"
-if [ "$CURRENT_DAY" -lt "$BILLING_DAY" ]; then
+if [ "$CURRENT_DAY" -lt "$BILLING_DAY" ] 2>/dev/null; then
   CURRENT_YYYYMM=$(date -v-1m +%Y%m 2>/dev/null || date -d "1 month ago" +%Y%m 2>/dev/null || echo "$CURRENT_YYYYMM")
 fi
 
@@ -122,16 +141,69 @@ fi
 [ ! -f "$CC_SESSIONS" ] && echo '{}' > "$CC_SESSIONS"
 
 # Update current session's peak cost
-if [ -n "$SESSION_ID" ] && [ "$(echo "${SESSION_COST:-0} > 0" | bc -l 2>/dev/null)" = "1" ]; then
+if [ -n "$SESSION_ID" ] && _gt "${SESSION_COST:-0}" 0; then
   EXISTING=$(jq -r --arg sid "$SESSION_ID" '.[$sid] // "0"' "$CC_SESSIONS" 2>/dev/null || echo "0")
-  if [ "$(echo "$SESSION_COST > $EXISTING" | bc -l 2>/dev/null)" = "1" ]; then
-    TMP_SESSIONS=$(mktemp /tmp/.cc_sessions_XXXXXX)
+  if _gt "${SESSION_COST}" "${EXISTING}"; then
+    TMP_SESSIONS=$(mktemp)
     jq --arg sid "$SESSION_ID" --argjson cost "$SESSION_COST" '.[$sid] = $cost' "$CC_SESSIONS" > "$TMP_SESSIONS" 2>/dev/null && mv "$TMP_SESSIONS" "$CC_SESSIONS"
   fi
 fi
 
 CC_MTD=$(jq '[.[]] | add // 0' "$CC_SESSIONS" 2>/dev/null | awk '{printf "%.2f", $1}')
 [ -z "$CC_MTD" ] && CC_MTD="0.00"
+
+# ── Today's cost from claudelytics (cached 5 min, background refresh) ──
+CLYTICS_CACHE="$HOME/.claude/.claudelytics_today_cache"
+CLYTICS_LOCK="$HOME/.claude/.claudelytics_refreshing"
+TODAY_COST="?"
+[ -f "$CLYTICS_CACHE" ] && TODAY_COST=$(cat "$CLYTICS_CACHE" 2>/dev/null)
+[ -z "$TODAY_COST" ] && TODAY_COST="?"
+
+if command -v claudelytics &>/dev/null; then
+  CLYTICS_STALE=0
+  [ ! -f "$CLYTICS_CACHE" ] && CLYTICS_STALE=1
+  [ "$CLYTICS_STALE" = "0" ] && [ "$(find "$CLYTICS_CACHE" -mmin +5 2>/dev/null | wc -l)" -gt 0 ] && CLYTICS_STALE=1
+  if [ "$CLYTICS_STALE" = "1" ] && [ ! -f "$CLYTICS_LOCK" ]; then
+    (
+      touch "$CLYTICS_LOCK"
+      result=$(claudelytics cost --today 2>/dev/null | awk '/^Cost:/ {gsub(/\$/,"",$2); printf "%.0f",$2; exit}')
+      [ -n "$result" ] && echo "$result" > "$CLYTICS_CACHE"
+      rm -f "$CLYTICS_LOCK"
+    ) &
+  fi
+fi
+
+# ── RTK savings today (from SQLite, cached 5 min, background refresh) ──
+RTK_DB="$HOME/Library/Application Support/rtk/history.db"
+RTK_CACHE="$HOME/.claude/.rtk_today_cache"
+RTK_LOCK="$HOME/.claude/.rtk_refreshing"
+RTK_SAVED=""
+[ -f "$RTK_CACHE" ] && RTK_SAVED=$(cat "$RTK_CACHE" 2>/dev/null)
+
+if [ -f "$RTK_DB" ] && command -v sqlite3 &>/dev/null; then
+  RTK_STALE=0
+  [ ! -f "$RTK_CACHE" ] && RTK_STALE=1
+  [ "$RTK_STALE" = "0" ] && [ "$(find "$RTK_CACHE" -mmin +5 2>/dev/null | wc -l)" -gt 0 ] && RTK_STALE=1
+  if [ "$RTK_STALE" = "1" ] && [ ! -f "$RTK_LOCK" ]; then
+    (
+      touch "$RTK_LOCK"
+      # Use awk to get a clean integer from sqlite3 (strips newlines, handles empty)
+      saved=$(sqlite3 "$RTK_DB" "SELECT COALESCE(SUM(saved_tokens),0) FROM commands WHERE date(timestamp,'localtime')=date('now','localtime')" 2>/dev/null | awk 'NR==1{print int($1+0)}')
+      saved="${saved:-0}"
+      if [ "$saved" -gt 0 ] 2>/dev/null; then
+        awk -v n="$saved" 'BEGIN{
+          v=n/1000;
+          if(v<10) printf "%.1fk",v;
+          else if(v<1000) printf "%dk",v;
+          else printf "%.1fM",v/1000;
+        }' > "$RTK_CACHE"
+      else
+        echo "" > "$RTK_CACHE"
+      fi
+      rm -f "$RTK_LOCK"
+    ) &
+  fi
+fi
 
 # ── Build colored context progress bar ──
 BAR_WIDTH=12
@@ -176,11 +248,29 @@ fi
 GH_PREFIX=""
 [ -n "$GH_USER" ] && GH_PREFIX="@${GH_USER} | "
 
+# ── API org total (from Admin API cache, rounded for display) ──
+API_TOTAL_RAW=$(cat "$HOME/.claude/.api_cost_cache" 2>/dev/null | tr -d '[:space:]')
+if [ -n "$API_TOTAL_RAW" ]; then
+  API_TOTAL=$(echo "$API_TOTAL_RAW" | awk '{printf "%d", $1}')
+else
+  API_TOTAL="?"
+fi
+
+# ── Burn rate ($/min for current session) ──
+BURN_RATE="-.--"
+if [ "$SESSION_DURATION_MS" -gt 0 ] 2>/dev/null && _gt "${SESSION_COST:-0}" 0; then
+  BURN_RATE=$(echo "$SESSION_COST $SESSION_DURATION_MS" | awk '{printf "%.2f", ($1 / ($2 / 60000))}')
+fi
+
+# ── RTK savings segment (dim, only if non-empty) ──
+RTK_SEGMENT=""
+[ -n "$RTK_SAVED" ] && RTK_SEGMENT="  ${DIM}↓${RTK_SAVED} rtk${RESET}"
+
 # ── Output to statusline (two rows) ──
 # Row 1: user | model | [colored bar] pct% | health status
-# Row 2: $/1k · tokens/limit | session cost · API cost
+# Row 2: rate · tokens  sesh · burn  today · CC · org  [rtk]  [alert]
 ROW1="${GH_PREFIX}${MODEL} | ${BAR} ${PCT}%% | ${STATUS}"
-ROW2="${DIM}\$${COST_PER_1K}/1k · ${TOKEN_DISPLAY}/${CTX_LIMIT_K}${RESET}  ${DIM}\$${SESSION_COST_FMT} session · \$${CC_MTD} CC${RESET}"
+ROW2="${DIM}\$${COST_PER_1K}/1k · ${TOKEN_DISPLAY}/${CTX_LIMIT_K}${RESET}  ${DIM}\$${SESSION_COST_SHORT} sesh · \$${BURN_RATE}/min${RESET}  ${DIM}\$${TODAY_COST} today · \$${CC_MTD} CC · \$${API_TOTAL} org${RESET}${RTK_SEGMENT}${COST_ALERT}"
 printf "${ROW1}\n${ROW2}\n"
 
 # ── Astra Agent SDK row (ROW3) ──
@@ -218,8 +308,10 @@ fi
 TODAY=$(date +"%Y-%m-%d")
 EVENTS_FILE="$ASTRA_DIR/events/${TODAY}.jsonl"
 if [ -f "$EVENTS_FILE" ]; then
-  ERROR_COUNT=$(grep -c '"severity":"error"' "$EVENTS_FILE" 2>/dev/null || echo 0)
-  EVENT_COUNT=$(wc -l < "$EVENTS_FILE" 2>/dev/null | tr -d ' ')
+  ERROR_COUNT=$(grep -c '"severity":"error"' "$EVENTS_FILE" 2>/dev/null)
+  ERROR_COUNT="${ERROR_COUNT:-0}"
+  EVENT_COUNT=$(wc -l < "$EVENTS_FILE" 2>/dev/null | tr -d '[:space:]')
+  EVENT_COUNT="${EVENT_COUNT:-0}"
   [ "$ERROR_COUNT" -gt 0 ] \
     && ASTRA_ROW="${ASTRA_ROW}  \033[31m✗ ${ERROR_COUNT} err${RESET}" \
     || ASTRA_ROW="${ASTRA_ROW}  ${DIM}${EVENT_COUNT} events${RESET}"
@@ -267,8 +359,14 @@ EOF
     echo "| $TIME | $MODEL | ${PCT}% | \$$COST_PER_1K | \$$SESSION_COST_FMT | ~$TOKEN_DISPLAY | $GIT_BRANCH | $OBS_STATUS |" >> "$OBSIDIAN_FILE"
   fi
 
-  # Update/append API total footer
-  grep -v "API Key Total" "$OBSIDIAN_FILE" > /tmp/cc_obs_tmp && mv /tmp/cc_obs_tmp "$OBSIDIAN_FILE"
-  echo "" >> "$OBSIDIAN_FILE"
-  echo "**Claude Code Total (month-to-date):** \$${CC_MTD}" >> "$OBSIDIAN_FILE"
+  # Update footer in-place (fixes blank-line accumulation bug from grep-v approach)
+  # Use @ as sed delimiter (avoids conflict with | in footer text)
+  FOOTER_LINE="**Claude Code Total (month-to-date):** \$${CC_MTD}  **Today:** \$${TODAY_COST}"
+  if grep -q "^\*\*Claude Code Total" "$OBSIDIAN_FILE" 2>/dev/null; then
+    sed -i '' "s@^\*\*Claude Code Total.*@${FOOTER_LINE}@" "$OBSIDIAN_FILE" 2>/dev/null || \
+    sed -i "s@^\*\*Claude Code Total.*@${FOOTER_LINE}@" "$OBSIDIAN_FILE" 2>/dev/null
+  else
+    echo "" >> "$OBSIDIAN_FILE"
+    echo "$FOOTER_LINE" >> "$OBSIDIAN_FILE"
+  fi
 fi

@@ -8,7 +8,7 @@ A real-time statusline for [Claude Code](https://docs.anthropic.com/en/docs/clau
 
 - **Context rot tracking** — visual progress bar + health warnings at 70% and 85%
 - **Real-time cost** — per-1k-token rate and session total
-- **API spend** — month-to-date billing via Anthropic Admin API (optional)
+- **API spend** — per-key month-to-date cost tracked locally from Claude Code sessions
 - **GitHub identity** — shows your `@username` from `gh` CLI
 - **Obsidian logging** — auto-generates daily session tables (optional)
 
@@ -58,7 +58,8 @@ All configuration is via environment variables. Add these to your `.zshrc` / `.b
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `OBSIDIAN_VAULT` | No | Path to your Obsidian vault for session logging |
-| `ANTHROPIC_ADMIN_API_KEY` | No | Admin API key for month-to-date spend tracking |
+| `ANTHROPIC_ADMIN_API_KEY` | No | Admin API key for org-wide spend diagnostics (`--test-api`) |
+| `ANTHROPIC_BILLING_START_DAY` | No | Day of month your billing cycle starts (default: 01) |
 
 ### Example `.zshrc`
 
@@ -139,10 +140,11 @@ Claude Code pipes a JSON blob to the statusline command on each update. The scri
 **`jq: command not found`**
 - Install jq: `brew install jq` (macOS) or `apt install jq` (Linux)
 
-**API cost shows $0.00?**
-- Check that `ANTHROPIC_ADMIN_API_KEY` is set: `echo $ANTHROPIC_ADMIN_API_KEY`
-- The key needs Admin permissions, not just API access
-- Cost data refreshes every 5 minutes (check `~/.claude/.api_cost_cache`)
+**CC cost shows $0.00?**
+- Costs are tracked locally from Claude Code sessions — they accumulate as you use Claude Code
+- The counter resets each billing cycle (controlled by `ANTHROPIC_BILLING_START_DAY`)
+- To see the running total: `jq '[.[]] | add // 0' ~/.claude/.cc_sessions.json`
+- To reset manually: `echo '{}' > ~/.claude/.cc_sessions.json`
 
 **GitHub username not showing?**
 - Make sure you're logged in: `gh auth status`

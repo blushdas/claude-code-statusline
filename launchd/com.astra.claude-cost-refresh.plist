@@ -15,14 +15,14 @@
     <dict>
         <key>ANTHROPIC_ADMIN_API_KEY</key>
         <string>YOUR_ANTHROPIC_ADMIN_API_KEY</string>
-        <key>ANTHROPIC_KEY_CREATED</key>
-        <string>YOUR_KEY_CREATED_ISO8601</string>
+        <key>ANTHROPIC_BILLING_START_DAY</key>
+        <string>01</string>
         <key>HOME</key>
         <string>/Users/YOUR_USERNAME</string>
     </dict>
 
     <key>StartInterval</key>
-    <integer>300</integer>
+    <integer>3600</integer>
 
     <key>RunAtLoad</key>
     <true/>

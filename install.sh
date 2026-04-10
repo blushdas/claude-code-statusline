@@ -54,37 +54,61 @@ fi
 # ── Ensure ~/.claude exists ──
 mkdir -p "$HOME/.claude"
 
-# ── Copy statusline script ──
+# ── Copy scripts ──
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cp "$SCRIPT_DIR/statusline.sh" "$HOME/.claude/statusline.sh"
 chmod +x "$HOME/.claude/statusline.sh"
 echo -e "${GREEN}✓${NC} Installed statusline.sh to ~/.claude/statusline.sh"
 
+mkdir -p "$HOME/.claude/scripts"
+cp "$SCRIPT_DIR/scripts/refresh-api-cost.sh" "$HOME/.claude/scripts/refresh-api-cost.sh"
+chmod +x "$HOME/.claude/scripts/refresh-api-cost.sh"
+echo -e "${GREEN}✓${NC} Installed refresh-api-cost.sh to ~/.claude/scripts/refresh-api-cost.sh"
+
 # ── Merge statusLine config into settings.json ──
 SETTINGS_FILE="$HOME/.claude/settings.json"
 
+HOOK_CMD="bash ~/.claude/scripts/refresh-api-cost.sh"
+
 if [ -f "$SETTINGS_FILE" ]; then
-  # Check if statusLine is already configured
+  TMP=$(mktemp)
+
+  # Add statusLine if missing
   if jq -e '.statusLine' "$SETTINGS_FILE" &>/dev/null; then
     echo -e "${YELLOW}!${NC} statusLine already configured in settings.json — skipping"
+    cp "$SETTINGS_FILE" "$TMP"
   else
-    # Merge statusLine into existing settings
-    TMP=$(mktemp)
     jq '. + {"statusLine": {"type": "command", "command": "bash ~/.claude/statusline.sh"}}' "$SETTINGS_FILE" > "$TMP"
-    mv "$TMP" "$SETTINGS_FILE"
     echo -e "${GREEN}✓${NC} Added statusLine config to settings.json"
   fi
+
+  # Add SessionStart hook if missing
+  if jq -e '.hooks.SessionStart' "$TMP" &>/dev/null; then
+    echo -e "${YELLOW}!${NC} SessionStart hook already configured — skipping"
+  else
+    TMP2=$(mktemp)
+    jq --arg cmd "$HOOK_CMD" '.hooks.SessionStart += [{"type": "command", "command": $cmd}]' "$TMP" > "$TMP2"
+    mv "$TMP2" "$TMP"
+    echo -e "${GREEN}✓${NC} Added SessionStart hook to settings.json"
+  fi
+
+  mv "$TMP" "$SETTINGS_FILE"
 else
-  # Create new settings.json with just statusLine
-  cat > "$SETTINGS_FILE" << 'EOF'
+  # Create new settings.json
+  cat > "$SETTINGS_FILE" << EOF
 {
   "statusLine": {
     "type": "command",
     "command": "bash ~/.claude/statusline.sh"
+  },
+  "hooks": {
+    "SessionStart": [
+      {"type": "command", "command": "$HOOK_CMD"}
+    ]
   }
 }
 EOF
-  echo -e "${GREEN}✓${NC} Created settings.json with statusLine config"
+  echo -e "${GREEN}✓${NC} Created settings.json with statusLine and SessionStart hook"
 fi
 
 # ── Optional: Environment variables ──
@@ -117,6 +141,7 @@ if [ -n "$ADMIN_KEY" ]; then
   EXPORT_KEY="export ANTHROPIC_ADMIN_API_KEY=\"$ADMIN_KEY\""
 fi
 
+
 # ── Write to shell profile ──
 if [ -n "$EXPORT_VAULT" ] || [ -n "$EXPORT_KEY" ]; then
   echo ""
@@ -146,6 +171,32 @@ if [ -n "$EXPORT_VAULT" ] || [ -n "$EXPORT_KEY" ]; then
     echo "Add these to your shell profile manually:"
     [ -n "$EXPORT_VAULT" ] && echo "  $EXPORT_VAULT"
     [ -n "$EXPORT_KEY" ] && echo "  $EXPORT_KEY"
+  fi
+fi
+
+# ── Install launchd daemon (macOS only) ──
+if [[ "$OSTYPE" == "darwin"* ]] && [ -n "$ADMIN_KEY" ]; then
+  PLIST_SRC="$SCRIPT_DIR/launchd/com.astra.claude-cost-refresh.plist"
+  PLIST_DEST="$HOME/Library/LaunchAgents/com.astra.claude-cost-refresh.plist"
+  BILLING_DAY_VAL="${ANTHROPIC_BILLING_START_DAY:-01}"
+
+  echo ""
+  read -p "Install hourly cost refresh daemon via launchd? (Y/n) " -n 1 -r
+  echo ""
+  if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+    sed \
+      -e "s|YOUR_USERNAME|$(whoami)|g" \
+      -e "s|YOUR_ANTHROPIC_ADMIN_API_KEY|$ADMIN_KEY|g" \
+      -e "s|<string>01</string>|<string>$BILLING_DAY_VAL</string>|" \
+      "$PLIST_SRC" > "$PLIST_DEST"
+
+    # Unload existing if running
+    launchctl unload "$PLIST_DEST" 2>/dev/null || true
+    launchctl load "$PLIST_DEST"
+    echo -e "${GREEN}✓${NC} Launchd daemon installed and loaded (runs hourly)"
+    echo -e "${DIM}  Logs: /tmp/claude-cost-refresh.log${NC}"
+  else
+    echo -e "${DIM}  Skipped. To install later: launchctl load $PLIST_DEST${NC}"
   fi
 fi
 

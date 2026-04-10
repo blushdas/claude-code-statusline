@@ -26,7 +26,7 @@ if [ "${1}" = "--test-api" ]; then
   BILLING_DAY="${ANTHROPIC_BILLING_START_DAY:-01}"
   START_DATE=$(date -u +"%Y-%m-${BILLING_DAY}T00:00:00Z")
   END_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-  echo "Fetching cost report: $START_DATE → $END_DATE"
+  echo "Fetching org-wide cost report: $START_DATE → $END_DATE"
   TOTAL_CENTS=0; PAGE=""; PAGE_NUM=0
   while true; do
     PAGE_PARAM=""; [ -n "$PAGE" ] && PAGE_PARAM="&page=${PAGE}"
@@ -47,11 +47,20 @@ if [ "${1}" = "--test-api" ]; then
     [ -z "$PAGE" ] && break
   done
   TOTAL=$(echo "$TOTAL_CENTS" | awk '{printf "%.2f", $1 / 100}')
-  echo "Total: \$$TOTAL (from $PAGE_NUM page(s), $TOTAL_CENTS cents raw)"
+  echo "Org total: \$$TOTAL (from $PAGE_NUM page(s), $TOTAL_CENTS cents raw)"
+  CC_SESSIONS="$HOME/.claude/.cc_sessions.json"
+  if [ -f "$CC_SESSIONS" ]; then
+    CC_MTD=$(jq '[.[]] | add // 0' "$CC_SESSIONS" 2>/dev/null | awk '{printf "%.4f", $1}')
+    SESSION_COUNT=$(jq 'keys | length' "$CC_SESSIONS" 2>/dev/null || echo "?")
+    echo "CC key total: \$$CC_MTD (from $SESSION_COUNT sessions, locally tracked)"
+  fi
   exit 0
 fi
 
 input=$(cat)
+
+# ── Extract session ID (used by Astra SDK) ──
+SESSION_ID=$(echo "$input" | jq -r '.session_id // ""')
 
 # ── Extract core fields from JSON ──
 MODEL=$(echo "$input" | jq -r '.model.display_name // "unknown"')
@@ -90,66 +99,39 @@ else
   GH_USER=$(cat "$GH_CACHE" 2>/dev/null || echo "")
 fi
 
-# ── Anthropic Admin API — total API key spend (cached 5 min) ──
-API_COST_CACHE="$HOME/.claude/.api_cost_cache"
-API_COST_AGE=$(find "$API_COST_CACHE" -mmin +5 2>/dev/null | wc -l)
+# ── Local CC cost accumulator (per-key, month-to-date) ──
+# Tracks Claude Code session costs locally — accurate per API key, no Admin API needed.
+# Resets each billing cycle. Each session's peak cost is stored; sum = MTD total.
+CC_SESSIONS="$HOME/.claude/.cc_sessions.json"
+CC_BILLING_MONTH_FILE="$HOME/.claude/.cc_billing_month"
+BILLING_DAY="${ANTHROPIC_BILLING_START_DAY:-01}"
 
-if [ ! -f "$API_COST_CACHE" ] || [ "$API_COST_AGE" -gt 0 ]; then
-  if [ -n "$ANTHROPIC_ADMIN_API_KEY" ]; then
-    BILLING_DAY="${ANTHROPIC_BILLING_START_DAY:-01}"
-    START_DATE=$(date -u +"%Y-%m-${BILLING_DAY}T00:00:00Z")
-    END_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    debug "Fetching cost report: $START_DATE → $END_DATE"
+CURRENT_YYYYMM=$(date +%Y%m)
+CURRENT_DAY=$((10#$(date +%d)))
+# If we haven't reached the billing day this month, billing period is still "last month"
+if [ "$CURRENT_DAY" -lt "$BILLING_DAY" ]; then
+  CURRENT_YYYYMM=$(date -v-1m +%Y%m 2>/dev/null || date -d "1 month ago" +%Y%m 2>/dev/null || echo "$CURRENT_YYYYMM")
+fi
 
-    # Paginate until has_more is false — API returns one bucket per day
-    TOTAL_CENTS=0; PAGE=""; PAGE_NUM=0; FETCH_OK=false
-    while true; do
-      PAGE_PARAM=""; [ -n "$PAGE" ] && PAGE_PARAM="&page=${PAGE}"
-      RESPONSE=$(curl -sf --max-time 10 \
-        "https://api.anthropic.com/v1/organizations/cost_report?starting_at=${START_DATE}&ending_at=${END_DATE}&bucket_width=1d&limit=31${PAGE_PARAM}" \
-        --header "anthropic-version: 2023-06-01" \
-        --header "x-api-key: $ANTHROPIC_ADMIN_API_KEY" 2>/dev/null)
-      CURL_EXIT=$?
-      debug "Page $((PAGE_NUM+1)) curl exit=$CURL_EXIT response_len=${#RESPONSE}"
+STORED_YYYYMM=$(cat "$CC_BILLING_MONTH_FILE" 2>/dev/null || echo "")
+if [ "$STORED_YYYYMM" != "$CURRENT_YYYYMM" ]; then
+  echo '{}' > "$CC_SESSIONS"
+  echo "$CURRENT_YYYYMM" > "$CC_BILLING_MONTH_FILE"
+fi
 
-      # Abort on curl failure or API error — keep old cache value
-      if [ "$CURL_EXIT" -ne 0 ] || [ -z "$RESPONSE" ]; then
-        debug "curl failed, keeping stale cache"
-        break
-      fi
-      ERROR=$(echo "$RESPONSE" | jq -r '.error.message // empty' 2>/dev/null)
-      if [ -n "$ERROR" ]; then
-        debug "API error: $ERROR"
-        break
-      fi
+[ ! -f "$CC_SESSIONS" ] && echo '{}' > "$CC_SESSIONS"
 
-      PAGE_NUM=$((PAGE_NUM + 1))
-      FETCH_OK=true
-      PAGE_CENTS=$(echo "$RESPONSE" | jq '[.data[].results[]?.amount // "0" | tonumber] | add // 0' 2>/dev/null)
-      debug "Page $PAGE_NUM: $PAGE_CENTS cents"
-      TOTAL_CENTS=$(echo "$TOTAL_CENTS + ${PAGE_CENTS:-0}" | bc -l)
-
-      HAS_MORE=$(echo "$RESPONSE" | jq -r '.has_more // false' 2>/dev/null)
-      [ "$HAS_MORE" != "true" ] && break
-      PAGE=$(echo "$RESPONSE" | jq -r '.next_page // empty' 2>/dev/null)
-      [ -z "$PAGE" ] && break
-    done
-
-    # Only update cache on a successful fetch — never overwrite with failure
-    if [ "$FETCH_OK" = "true" ]; then
-      API_TOTAL=$(echo "$TOTAL_CENTS" | awk '{printf "%.2f", $1 / 100}')
-      debug "Total: \$$API_TOTAL ($PAGE_NUM pages, $TOTAL_CENTS cents)"
-      echo "$API_TOTAL" > "$API_COST_CACHE"
-    fi
-  else
-    # Fallback: read locally accumulated session costs if no Admin API key
-    LOCAL_LOG="$HOME/.claude/.session_cost_total"
-    PREV_TOTAL=$(cat "$LOCAL_LOG" 2>/dev/null || echo "0")
-    echo "$PREV_TOTAL" > "$API_COST_CACHE"
+# Update current session's peak cost
+if [ -n "$SESSION_ID" ] && [ "$(echo "${SESSION_COST:-0} > 0" | bc -l 2>/dev/null)" = "1" ]; then
+  EXISTING=$(jq -r --arg sid "$SESSION_ID" '.[$sid] // "0"' "$CC_SESSIONS" 2>/dev/null || echo "0")
+  if [ "$(echo "$SESSION_COST > $EXISTING" | bc -l 2>/dev/null)" = "1" ]; then
+    TMP_SESSIONS=$(mktemp /tmp/.cc_sessions_XXXXXX)
+    jq --arg sid "$SESSION_ID" --argjson cost "$SESSION_COST" '.[$sid] = $cost' "$CC_SESSIONS" > "$TMP_SESSIONS" 2>/dev/null && mv "$TMP_SESSIONS" "$CC_SESSIONS"
   fi
 fi
 
-API_TOTAL=$(cat "$API_COST_CACHE" 2>/dev/null || echo "0.00")
+CC_MTD=$(jq '[.[]] | add // 0' "$CC_SESSIONS" 2>/dev/null | awk '{printf "%.2f", $1}')
+[ -z "$CC_MTD" ] && CC_MTD="0.00"
 
 # ── Build colored context progress bar ──
 BAR_WIDTH=12
@@ -198,8 +180,52 @@ GH_PREFIX=""
 # Row 1: user | model | [colored bar] pct% | health status
 # Row 2: $/1k · tokens/limit | session cost · API cost
 ROW1="${GH_PREFIX}${MODEL} | ${BAR} ${PCT}%% | ${STATUS}"
-ROW2="${DIM}\$${COST_PER_1K}/1k · ${TOKEN_DISPLAY}/${CTX_LIMIT_K}${RESET}  ${DIM}\$${SESSION_COST_FMT} session · \$${API_TOTAL} API${RESET}"
+ROW2="${DIM}\$${COST_PER_1K}/1k · ${TOKEN_DISPLAY}/${CTX_LIMIT_K}${RESET}  ${DIM}\$${SESSION_COST_FMT} session · \$${CC_MTD} CC${RESET}"
 printf "${ROW1}\n${ROW2}\n"
+
+# ── Astra Agent SDK row (ROW3) ──
+ASTRA_DIR="$HOME/.astra"
+ASTRA_ROW=""
+
+# Registry summary
+if [ -f "$ASTRA_DIR/registry.json" ]; then
+  ASTRA_AGENTS=$(jq -r '.agentCount // ""' "$ASTRA_DIR/registry.json" 2>/dev/null)
+  ASTRA_DIVS=$(jq -r '.divisionCount // ""' "$ASTRA_DIR/registry.json" 2>/dev/null)
+  [ -n "$ASTRA_AGENTS" ] && ASTRA_ROW="${DIM}⬡ ${ASTRA_AGENTS} agents/${ASTRA_DIVS} div${RESET}"
+fi
+
+# Workflow state
+WORKFLOW_STATUS=""
+if [ -n "$SESSION_ID" ] && [ -f "$ASTRA_DIR/workflow/${SESSION_ID}.json" ]; then
+  WORKFLOW_STATUS=$(jq -r '.status // ""' "$ASTRA_DIR/workflow/${SESSION_ID}.json" 2>/dev/null)
+  WORKFLOW_PHASE=$(jq -r '.currentPhase // ""' "$ASTRA_DIR/workflow/${SESSION_ID}.json" 2>/dev/null)
+  if [ -n "$WORKFLOW_STATUS" ]; then
+    PHASE_LABEL=""
+    [ -n "$WORKFLOW_PHASE" ] && PHASE_LABEL=" (${WORKFLOW_PHASE})"
+    case "$WORKFLOW_STATUS" in
+      executing)  WF_COLOR="\033[32m" ;;
+      crashed)    WF_COLOR="\033[31m" ;;
+      blocked)    WF_COLOR="\033[33m" ;;
+      complete)   WF_COLOR="\033[35m" ;;
+      *)          WF_COLOR="\033[2m" ;;
+    esac
+    WF_SEGMENT="${WF_COLOR}◆ ${WORKFLOW_STATUS}${PHASE_LABEL}${RESET}"
+    ASTRA_ROW="${ASTRA_ROW}  ${WF_SEGMENT}"
+  fi
+fi
+
+# Event log error count today
+TODAY=$(date +"%Y-%m-%d")
+EVENTS_FILE="$ASTRA_DIR/events/${TODAY}.jsonl"
+if [ -f "$EVENTS_FILE" ]; then
+  ERROR_COUNT=$(grep -c '"severity":"error"' "$EVENTS_FILE" 2>/dev/null || echo 0)
+  EVENT_COUNT=$(wc -l < "$EVENTS_FILE" 2>/dev/null | tr -d ' ')
+  [ "$ERROR_COUNT" -gt 0 ] \
+    && ASTRA_ROW="${ASTRA_ROW}  \033[31m✗ ${ERROR_COUNT} err${RESET}" \
+    || ASTRA_ROW="${ASTRA_ROW}  ${DIM}${EVENT_COUNT} events${RESET}"
+fi
+
+[ -n "$ASTRA_ROW" ] && printf "${ASTRA_ROW}\n"
 
 # ── Write to Obsidian vault ──
 if [ -n "$OBSIDIAN_VAULT" ] && [ -d "$OBSIDIAN_VAULT" ]; then
@@ -244,5 +270,5 @@ EOF
   # Update/append API total footer
   grep -v "API Key Total" "$OBSIDIAN_FILE" > /tmp/cc_obs_tmp && mv /tmp/cc_obs_tmp "$OBSIDIAN_FILE"
   echo "" >> "$OBSIDIAN_FILE"
-  echo "**API Key Total (month-to-date):** \$${API_TOTAL}" >> "$OBSIDIAN_FILE"
+  echo "**Claude Code Total (month-to-date):** \$${CC_MTD}" >> "$OBSIDIAN_FILE"
 fi

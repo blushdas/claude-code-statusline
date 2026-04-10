@@ -262,15 +262,33 @@ if [ "$SESSION_DURATION_MS" -gt 0 ] 2>/dev/null && _gt "${SESSION_COST:-0}" 0; t
   BURN_RATE=$(echo "$SESSION_COST $SESSION_DURATION_MS" | awk '{printf "%.2f", ($1 / ($2 / 60000))}')
 fi
 
-# ── RTK savings segment (dim, only if non-empty) ──
+# ── ANSI color palette ──
+BOLD="\033[1m"
+WHITE="\033[37;1m"
+CYAN="\033[36m"
+YELLOW="\033[33m"
+GREEN="\033[32m"
+RED="\033[31m"
+MAGENTA="\033[35m"
+DIM_SEP="\033[2m"
+
+# ── RTK savings segment (green, only if non-empty) ──
 RTK_SEGMENT=""
-[ -n "$RTK_SAVED" ] && RTK_SEGMENT="  ${DIM}↓${RTK_SAVED} rtk${RESET}"
+[ -n "$RTK_SAVED" ] && RTK_SEGMENT="  ${GREEN}↓${RTK_SAVED}${RESET} ${DIM}rtk${RESET}"
 
 # ── Output to statusline (two rows) ──
 # Row 1: user | model | [colored bar] pct% | health status
-# Row 2: rate · tokens  sesh · burn  today · CC · org  [rtk]  [alert]
-ROW1="${GH_PREFIX}${MODEL} | ${BAR} ${PCT}%% | ${STATUS}"
-ROW2="${DIM}\$${COST_PER_1K}/1k · ${TOKEN_DISPLAY}/${CTX_LIMIT_K}${RESET}  ${DIM}\$${SESSION_COST_SHORT} sesh · \$${BURN_RATE}/min${RESET}  ${DIM}\$${TODAY_COST} today · \$${CC_MTD} CC · \$${API_TOTAL} org${RESET}${RTK_SEGMENT}${COST_ALERT}"
+#   Dim pipes for structure, data stands out
+# Row 2: color-coded by importance
+#   dim=reference, bold=session cost, cyan=today, yellow=MTD, green=rtk savings
+ROW1="${DIM}@${RESET}${GH_USER} ${DIM}|${RESET} ${MODEL} ${DIM}|${RESET} ${BAR} ${PCT}%% ${DIM}|${RESET} ${STATUS}"
+[ -z "$GH_USER" ] && ROW1="${MODEL} ${DIM}|${RESET} ${BAR} ${PCT}%% ${DIM}|${RESET} ${STATUS}"
+
+ROW2="${DIM}\$${COST_PER_1K}/1k · ${TOKEN_DISPLAY}/${CTX_LIMIT_K}${RESET}"
+ROW2="${ROW2}  ${WHITE}\$${SESSION_COST_SHORT}${RESET} ${DIM}sesh${RESET} ${DIM}·${RESET} ${DIM}\$${BURN_RATE}/min${RESET}"
+ROW2="${ROW2}  ${CYAN}\$${TODAY_COST}${RESET} ${DIM}today${RESET} ${DIM}·${RESET} ${YELLOW}\$${CC_MTD}${RESET} ${DIM}CC${RESET} ${DIM}·${RESET} ${DIM}\$${API_TOTAL} org${RESET}"
+ROW2="${ROW2}${RTK_SEGMENT}${COST_ALERT}"
+
 printf "${ROW1}\n${ROW2}\n"
 
 # ── Astra Agent SDK row (ROW3) ──

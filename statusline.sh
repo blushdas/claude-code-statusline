@@ -14,13 +14,13 @@
 # Context rot thresholds based on Claude Opus 4.6 Context Management Spec v1.0:
 #   0-50%: Healthy | 50-75%: Attention | 75-90%: Checkpoint | 90-95%: Critical | 95%+: Emergency
 
+# ── Pure computation functions ──
+STATUSLINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$STATUSLINE_DIR/lib/compute.sh"
+
 # ── Debug helper ──
 DEBUG_LOG="$HOME/.claude/.statusline_debug.log"
 debug() { [ -n "$CLAUDE_STATUSLINE_DEBUG" ] && echo "[$(date -u +%H:%M:%S)] $*" >> "$DEBUG_LOG"; }
-
-# ── Float comparison helpers (replaces bc dependency) ──
-_gt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
-_ge() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'; }
 
 # ── Test mode: bash statusline.sh --test-api ──
 if [ "${1}" = "--test-api" ]; then
@@ -81,25 +81,22 @@ USED_TOKENS=$(echo "$input" | jq -r '
    (.context_window.current_usage.output_tokens // 0))
 ')
 
+# ── Fallback: derive tokens from percentage when current_usage is zero ──
+# used_percentage includes system prompt + tools + memory + conversation.
+# current_usage only counts conversation tokens from model turns.
+USED_TOKENS=$(token_or_fallback "$USED_TOKENS" "$PCT" "$CTX_SIZE")
+
 # ── Cost per 1k tokens (real-time) ──
-if [ "$USED_TOKENS" -gt 0 ] && _gt "${SESSION_COST:-0}" 0; then
-  COST_PER_1K=$(echo "$SESSION_COST $USED_TOKENS" | awk '{printf "%.4f", ($1 / $2) * 1000}')
-else
-  COST_PER_1K="0.0000"
-fi
+COST_PER_1K=$(cost_per_1k "$SESSION_COST" "$USED_TOKENS")
 
 SESSION_COST_FMT=$(printf "%.4f" "$SESSION_COST")
 SESSION_COST_SHORT=$(printf "%.2f" "$SESSION_COST")
 
 # ── Token display with smart precision (e.g. 1.2k not 1k for <10k) ──
-TOKEN_DISPLAY=$(echo "$USED_TOKENS" | awk '{
-  v = $1/1000;
-  if (v < 10) printf "%.1fk", v;
-  else printf "%dk", v;
-}')
+TOKEN_DISPLAY=$(token_display "$USED_TOKENS")
 
 # ── Context window size in k ──
-CTX_LIMIT_K=$(echo "$CTX_SIZE" | awk '{printf "%dk", $1/1000}')
+CTX_LIMIT_K=$(ctx_limit_k "$CTX_SIZE")
 
 # ── Session cost alert thresholds ──
 COST_ALERT=""
@@ -207,21 +204,9 @@ fi
 
 # ── Build colored context progress bar ──
 BAR_WIDTH=12
-FILLED=$((PCT * BAR_WIDTH / 100))
+FILLED=$(bar_filled "$PCT" "$BAR_WIDTH")
 EMPTY=$((BAR_WIDTH - FILLED))
-
-# ANSI color codes based on threshold tier
-if [ "$PCT" -ge 95 ]; then
-  BAR_COLOR="\033[41;37;1m"  # red bg, white bold (flash effect)
-elif [ "$PCT" -ge 90 ]; then
-  BAR_COLOR="\033[31m"       # red
-elif [ "$PCT" -ge 75 ]; then
-  BAR_COLOR="\033[38;5;208m" # orange
-elif [ "$PCT" -ge 50 ]; then
-  BAR_COLOR="\033[33m"       # yellow
-else
-  BAR_COLOR="\033[32m"       # green
-fi
+BAR_COLOR="\033[$(bar_color_code "$PCT")m"
 RESET="\033[0m"
 DIM="\033[2m"
 
@@ -232,16 +217,11 @@ EMPTY_STR=""
 BAR="${BAR_COLOR}${FILLED_STR}${RESET}${DIM}${EMPTY_STR}${RESET}"
 
 # ── Context rot status (Claude Opus 4.6 Context Management Spec v1.0) ──
+STATUS_TEXT=$(status_label "$PCT")
 if [ "$PCT" -ge 95 ]; then
-  STATUS="${BAR_COLOR}◉◉ EMERGENCY${RESET}"
-elif [ "$PCT" -ge 90 ]; then
-  STATUS="${BAR_COLOR}● CRITICAL${RESET}"
-elif [ "$PCT" -ge 75 ]; then
-  STATUS="${BAR_COLOR}● CHECKPOINT${RESET}"
-elif [ "$PCT" -ge 50 ]; then
-  STATUS="${BAR_COLOR}● ATTENTION${RESET}"
+  STATUS="${BAR_COLOR}◉◉ ${STATUS_TEXT}${RESET}"
 else
-  STATUS="${BAR_COLOR}● healthy${RESET}"
+  STATUS="${BAR_COLOR}● ${STATUS_TEXT}${RESET}"
 fi
 
 # ── GitHub prefix ──
@@ -257,10 +237,7 @@ else
 fi
 
 # ── Burn rate ($/min for current session) ──
-BURN_RATE="-.--"
-if [ "$SESSION_DURATION_MS" -gt 0 ] 2>/dev/null && _gt "${SESSION_COST:-0}" 0; then
-  BURN_RATE=$(echo "$SESSION_COST $SESSION_DURATION_MS" | awk '{printf "%.2f", ($1 / ($2 / 60000))}')
-fi
+BURN_RATE=$(burn_rate "$SESSION_COST" "$SESSION_DURATION_MS")
 
 # ── ANSI color palette ──
 BOLD="\033[1m"

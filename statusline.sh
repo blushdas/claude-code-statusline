@@ -62,6 +62,7 @@ if [ "${1}" = "--test-api" ]; then
 fi
 
 input=$(cat)
+debug "RAW_PCT=$(echo "$input" | jq -r '.context_window.used_percentage // 0') RAW_TOKENS=$(echo "$input" | jq -r '.context_window.current_usage.input_tokens // 0')"
 
 # ── Extract session ID (used by Astra SDK) ──
 SESSION_ID=$(echo "$input" | jq -r '.session_id // ""')
@@ -149,26 +150,18 @@ fi
 CC_MTD=$(jq '[.[]] | add // 0' "$CC_SESSIONS" 2>/dev/null | awk '{printf "%.2f", $1}')
 [ -z "$CC_MTD" ] && CC_MTD="0.00"
 
-# ── Today's cost from claudelytics (cached 5 min, background refresh) ──
-CLYTICS_CACHE="$HOME/.claude/.claudelytics_today_cache"
-CLYTICS_LOCK="$HOME/.claude/.claudelytics_refreshing"
+# ── Claudelytics: today + all-time cost (single call, ~180ms, real-time) ──
 TODAY_COST="?"
-[ -f "$CLYTICS_CACHE" ] && TODAY_COST=$(cat "$CLYTICS_CACHE" 2>/dev/null)
-[ -z "$TODAY_COST" ] && TODAY_COST="?"
-
+CLYTICS_TOTAL="?"
 if command -v claudelytics &>/dev/null; then
-  CLYTICS_STALE=0
-  [ ! -f "$CLYTICS_CACHE" ] && CLYTICS_STALE=1
-  [ "$CLYTICS_STALE" = "0" ] && [ "$(find "$CLYTICS_CACHE" -mmin +5 2>/dev/null | wc -l)" -gt 0 ] && CLYTICS_STALE=1
-  if [ "$CLYTICS_STALE" = "1" ] && [ ! -f "$CLYTICS_LOCK" ]; then
-    (
-      touch "$CLYTICS_LOCK"
-      result=$(claudelytics cost --today 2>/dev/null | awk '/^Cost:/ {gsub(/\$/,"",$2); printf "%.0f",$2; exit}')
-      [ -n "$result" ] && echo "$result" > "$CLYTICS_CACHE"
-      rm -f "$CLYTICS_LOCK"
-    ) &
+  CLYTICS_JSON=$(claudelytics --json daily 2>/dev/null)
+  if [ -n "$CLYTICS_JSON" ]; then
+    TODAY_COST=$(echo "$CLYTICS_JSON" | jq -r --arg d "$(date +%Y-%m-%d)" '[.daily[] | select(.date == $d)] | .[0].totalCost // 0' 2>/dev/null | awk '{printf "%.0f", $1}')
+    CLYTICS_TOTAL=$(echo "$CLYTICS_JSON" | jq -r '.totals.totalCost // 0' 2>/dev/null | awk '{printf "%.0f", $1}')
   fi
 fi
+[ -z "$TODAY_COST" ] && TODAY_COST="?"
+[ -z "$CLYTICS_TOTAL" ] && CLYTICS_TOTAL="?"
 
 # ── RTK savings today (from SQLite, cached 5 min, background refresh) ──
 RTK_DB="$HOME/Library/Application Support/rtk/history.db"
@@ -181,6 +174,8 @@ if [ -f "$RTK_DB" ] && command -v sqlite3 &>/dev/null; then
   RTK_STALE=0
   [ ! -f "$RTK_CACHE" ] && RTK_STALE=1
   [ "$RTK_STALE" = "0" ] && [ "$(find "$RTK_CACHE" -mmin +5 2>/dev/null | wc -l)" -gt 0 ] && RTK_STALE=1
+  # Auto-clean stale lock (crashed refresh)
+  [ -f "$RTK_LOCK" ] && [ "$(find "$RTK_LOCK" -mmin +1 2>/dev/null | wc -l)" -gt 0 ] && rm -f "$RTK_LOCK"
   if [ "$RTK_STALE" = "1" ] && [ ! -f "$RTK_LOCK" ]; then
     (
       touch "$RTK_LOCK"
@@ -188,12 +183,7 @@ if [ -f "$RTK_DB" ] && command -v sqlite3 &>/dev/null; then
       saved=$(sqlite3 "$RTK_DB" "SELECT COALESCE(SUM(saved_tokens),0) FROM commands WHERE date(timestamp,'localtime')=date('now','localtime')" 2>/dev/null | awk 'NR==1{print int($1+0)}')
       saved="${saved:-0}"
       if [ "$saved" -gt 0 ] 2>/dev/null; then
-        awk -v n="$saved" 'BEGIN{
-          v=n/1000;
-          if(v<10) printf "%.1fk",v;
-          else if(v<1000) printf "%dk",v;
-          else printf "%.1fM",v/1000;
-        }' > "$RTK_CACHE"
+        rtk_format "$saved" > "$RTK_CACHE"
       else
         echo "" > "$RTK_CACHE"
       fi
@@ -263,10 +253,11 @@ ROW1="${DIM}@${RESET}${GH_USER} ${DIM}|${RESET} ${MODEL} ${DIM}|${RESET} ${BAR} 
 
 ROW2="${DIM}\$${COST_PER_1K}/1k · ${TOKEN_DISPLAY}/${CTX_LIMIT_K}${RESET}"
 ROW2="${ROW2}  ${WHITE}\$${SESSION_COST_SHORT}${RESET} ${DIM}sesh${RESET} ${DIM}·${RESET} ${DIM}\$${BURN_RATE}/min${RESET}"
-ROW2="${ROW2}  ${CYAN}\$${TODAY_COST}${RESET} ${DIM}today${RESET} ${DIM}·${RESET} ${YELLOW}\$${CC_MTD}${RESET} ${DIM}CC${RESET} ${DIM}·${RESET} ${DIM}\$${API_TOTAL} org${RESET}"
-ROW2="${ROW2}${RTK_SEGMENT}${COST_ALERT}"
 
-printf "${ROW1}\n${ROW2}\n"
+ROW3="${CYAN}\$${TODAY_COST}${RESET} ${DIM}today${RESET} ${DIM}·${RESET} ${YELLOW}\$${CLYTICS_TOTAL}${RESET} ${DIM}CC${RESET} ${DIM}·${RESET} ${DIM}\$${API_TOTAL} org${RESET}"
+ROW3="${ROW3}${RTK_SEGMENT}${COST_ALERT}"
+
+printf "${ROW1}\n${ROW2}\n${ROW3}\n"
 
 # ── Astra Agent SDK row (ROW3) ──
 ASTRA_DIR="$HOME/.astra"
@@ -341,12 +332,7 @@ EOF
   GIT_BRANCH=$(git -C "$(echo "$input" | jq -r '.workspace.current_dir // "."')" branch --show-current 2>/dev/null || echo "—")
 
   # Plaintext status for Obsidian (no ANSI)
-  if [ "$PCT" -ge 95 ]; then OBS_STATUS="EMERGENCY"
-  elif [ "$PCT" -ge 90 ]; then OBS_STATUS="CRITICAL"
-  elif [ "$PCT" -ge 75 ]; then OBS_STATUS="CHECKPOINT"
-  elif [ "$PCT" -ge 50 ]; then OBS_STATUS="ATTENTION"
-  else OBS_STATUS="healthy"
-  fi
+  OBS_STATUS=$(status_label "$PCT")
 
   # Append new row (avoids duplicate timestamps by checking last line)
   LAST_TIME=$(tail -1 "$OBSIDIAN_FILE" | grep -o "^| [0-9:]*" | tr -d '| ')
@@ -356,7 +342,7 @@ EOF
 
   # Update footer in-place (fixes blank-line accumulation bug from grep-v approach)
   # Use @ as sed delimiter (avoids conflict with | in footer text)
-  FOOTER_LINE="**Claude Code Total (month-to-date):** \$${CC_MTD}  **Today:** \$${TODAY_COST}"
+  FOOTER_LINE="**Claude Code Total (month-to-date):** \$${CLYTICS_TOTAL}  **Today:** \$${TODAY_COST}"
   if grep -q "^\*\*Claude Code Total" "$OBSIDIAN_FILE" 2>/dev/null; then
     sed -i '' "s@^\*\*Claude Code Total.*@${FOOTER_LINE}@" "$OBSIDIAN_FILE" 2>/dev/null || \
     sed -i "s@^\*\*Claude Code Total.*@${FOOTER_LINE}@" "$OBSIDIAN_FILE" 2>/dev/null

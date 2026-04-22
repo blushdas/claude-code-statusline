@@ -1,13 +1,11 @@
 #!/bin/bash
 
 # ─────────────────────────────────────────
-# Claude Code Statusline + Obsidian Logger
+# Claude Code Statusline
 # https://github.com/blushdas/claude-code-statusline
 # ─────────────────────────────────────────
 #
 # Environment variables:
-#   OBSIDIAN_VAULT              — Path to your Obsidian vault (optional, enables logging)
-#   ANTHROPIC_ADMIN_API_KEY     — Anthropic Admin API key (optional, enables API spend tracking)
 #   ANTHROPIC_BILLING_START_DAY — Day of month your billing cycle starts (default: 01)
 #   CLAUDE_STATUSLINE_DEBUG     — Set to 1 to log diagnostics to ~/.claude/.statusline_debug.log
 #
@@ -22,44 +20,6 @@ source "$STATUSLINE_DIR/lib/compute.sh"
 DEBUG_LOG="$HOME/.claude/.statusline_debug.log"
 debug() { [ -n "$CLAUDE_STATUSLINE_DEBUG" ] && echo "[$(date -u +%H:%M:%S)] $*" >> "$DEBUG_LOG"; }
 
-# ── Test mode: bash statusline.sh --test-api ──
-if [ "${1}" = "--test-api" ]; then
-  if [ -z "$ANTHROPIC_ADMIN_API_KEY" ]; then
-    echo "ERROR: ANTHROPIC_ADMIN_API_KEY is not set"; exit 1
-  fi
-  BILLING_DAY="${ANTHROPIC_BILLING_START_DAY:-01}"
-  START_DATE=$(date -u +"%Y-%m-${BILLING_DAY}T00:00:00Z")
-  END_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-  echo "Fetching org-wide cost report: $START_DATE → $END_DATE"
-  TOTAL_CENTS=0; PAGE=""; PAGE_NUM=0
-  while true; do
-    PAGE_PARAM=""; [ -n "$PAGE" ] && PAGE_PARAM="&page=${PAGE}"
-    RESPONSE=$(curl -sf --max-time 10 \
-      "https://api.anthropic.com/v1/organizations/cost_report?starting_at=${START_DATE}&ending_at=${END_DATE}&bucket_width=1d&limit=31${PAGE_PARAM}" \
-      --header "anthropic-version: 2023-06-01" \
-      --header "x-api-key: $ANTHROPIC_ADMIN_API_KEY")
-    [ $? -ne 0 ] && echo "ERROR: curl failed on page $((PAGE_NUM+1))" && exit 1
-    ERROR=$(echo "$RESPONSE" | jq -r '.error.message // empty' 2>/dev/null)
-    [ -n "$ERROR" ] && echo "API ERROR: $ERROR" && exit 1
-    PAGE_NUM=$((PAGE_NUM + 1))
-    PAGE_CENTS=$(echo "$RESPONSE" | jq '[.data[].results[]?.amount // "0" | tonumber] | add // 0' 2>/dev/null)
-    echo "  Page $PAGE_NUM: $PAGE_CENTS cents"
-    TOTAL_CENTS=$(awk -v a="$TOTAL_CENTS" -v b="${PAGE_CENTS:-0}" 'BEGIN{print a+b}')
-    HAS_MORE=$(echo "$RESPONSE" | jq -r '.has_more // false' 2>/dev/null)
-    [ "$HAS_MORE" != "true" ] && break
-    PAGE=$(echo "$RESPONSE" | jq -r '.next_page // empty' 2>/dev/null)
-    [ -z "$PAGE" ] && break
-  done
-  TOTAL=$(echo "$TOTAL_CENTS" | awk '{printf "%.2f", $1 / 100}')
-  echo "Org total: \$$TOTAL (from $PAGE_NUM page(s), $TOTAL_CENTS cents raw)"
-  CC_SESSIONS="$HOME/.claude/.cc_sessions.json"
-  if [ -f "$CC_SESSIONS" ]; then
-    CC_MTD=$(jq '[.[]] | add // 0' "$CC_SESSIONS" 2>/dev/null | awk '{printf "%.4f", $1}')
-    SESSION_COUNT=$(jq 'keys | length' "$CC_SESSIONS" 2>/dev/null || echo "?")
-    echo "CC key total: \$$CC_MTD (from $SESSION_COUNT sessions, locally tracked)"
-  fi
-  exit 0
-fi
 
 input=$(cat)
 debug "RAW_PCT=$(echo "$input" | jq -r '.context_window.used_percentage // 0') RAW_TOKENS=$(echo "$input" | jq -r '.context_window.current_usage.input_tokens // 0')"
@@ -86,6 +46,13 @@ USED_TOKENS=$(echo "$input" | jq -r '
 # used_percentage includes system prompt + tools + memory + conversation.
 # current_usage only counts conversation tokens from model turns.
 USED_TOKENS=$(token_or_fallback "$USED_TOKENS" "$PCT" "$CTX_SIZE")
+
+# ── Context bridge for gsd-context-monitor.js ──
+if [ -n "$SESSION_ID" ]; then
+  _CTX_REMAINING=$((100 - PCT))
+  printf '{"session_id":"%s","remaining_percentage":%d,"used_pct":%d,"timestamp":%d}' \
+    "$SESSION_ID" "$_CTX_REMAINING" "$PCT" "$(date +%s)" > "/tmp/claude-ctx-${SESSION_ID}.json"
+fi
 
 # ── Cost per 1k tokens (real-time) ──
 COST_PER_1K=$(cost_per_1k "$SESSION_COST" "$USED_TOKENS")
@@ -149,15 +116,33 @@ fi
 
 CC_MTD=$(jq '[.[]] | add // 0' "$CC_SESSIONS" 2>/dev/null | awk '{printf "%.2f", $1}')
 [ -z "$CC_MTD" ] && CC_MTD="0.00"
+CC_MTD_INT=$(echo "$CC_MTD" | awk '{printf "%.0f", $1}')
 
-# ── Claudelytics: today + all-time cost (single call, ~180ms, real-time) ──
+# ── Claudelytics: today + CC total (cached 60s, background refresh) ──
+CLYTICS_CACHE="$HOME/.claude/.claudelytics_today_cache"
+CLYTICS_TOTAL_CACHE="$HOME/.claude/.claudelytics_total_cache"
+CLYTICS_LOCK="$HOME/.claude/.claudelytics_refreshing"
 TODAY_COST="?"
 CLYTICS_TOTAL="?"
+[ -f "$CLYTICS_CACHE" ] && TODAY_COST=$(cat "$CLYTICS_CACHE" 2>/dev/null)
+[ -f "$CLYTICS_TOTAL_CACHE" ] && CLYTICS_TOTAL=$(cat "$CLYTICS_TOTAL_CACHE" 2>/dev/null)
+
 if command -v claudelytics &>/dev/null; then
-  CLYTICS_JSON=$(claudelytics --json daily 2>/dev/null)
-  if [ -n "$CLYTICS_JSON" ]; then
-    TODAY_COST=$(echo "$CLYTICS_JSON" | jq -r --arg d "$(date +%Y-%m-%d)" '[.daily[] | select(.date == $d)] | .[0].totalCost // 0' 2>/dev/null | awk '{printf "%.0f", $1}')
-    CLYTICS_TOTAL=$(echo "$CLYTICS_JSON" | jq -r '.totals.totalCost // 0' 2>/dev/null | awk '{printf "%.0f", $1}')
+  # Auto-clean stale lock (crashed refresh)
+  [ -f "$CLYTICS_LOCK" ] && cache_is_stale "$CLYTICS_LOCK" 60 && rm -f "$CLYTICS_LOCK"
+  if cache_is_stale "$CLYTICS_CACHE" 60 && [ ! -f "$CLYTICS_LOCK" ]; then
+    (
+      touch "$CLYTICS_LOCK"
+      CLYTICS_JSON=$(claudelytics --json daily 2>/dev/null)
+      if [ -n "$CLYTICS_JSON" ]; then
+        echo "$CLYTICS_JSON" | jq -r --arg d "$(date +%Y-%m-%d)" \
+          '[.daily[] | select(.date == $d)] | .[0].totalCost // 0' 2>/dev/null \
+          | awk '{printf "%.0f", $1}' > "$CLYTICS_CACHE"
+        echo "$CLYTICS_JSON" | jq -r '.totals.totalCost // 0' 2>/dev/null \
+          | awk '{printf "%.0f", $1}' > "$CLYTICS_TOTAL_CACHE"
+      fi
+      rm -f "$CLYTICS_LOCK"
+    ) &
   fi
 fi
 [ -z "$TODAY_COST" ] && TODAY_COST="?"
@@ -171,12 +156,9 @@ RTK_SAVED=""
 [ -f "$RTK_CACHE" ] && RTK_SAVED=$(cat "$RTK_CACHE" 2>/dev/null)
 
 if [ -f "$RTK_DB" ] && command -v sqlite3 &>/dev/null; then
-  RTK_STALE=0
-  [ ! -f "$RTK_CACHE" ] && RTK_STALE=1
-  [ "$RTK_STALE" = "0" ] && [ "$(find "$RTK_CACHE" -mmin +5 2>/dev/null | wc -l)" -gt 0 ] && RTK_STALE=1
   # Auto-clean stale lock (crashed refresh)
-  [ -f "$RTK_LOCK" ] && [ "$(find "$RTK_LOCK" -mmin +1 2>/dev/null | wc -l)" -gt 0 ] && rm -f "$RTK_LOCK"
-  if [ "$RTK_STALE" = "1" ] && [ ! -f "$RTK_LOCK" ]; then
+  [ -f "$RTK_LOCK" ] && cache_is_stale "$RTK_LOCK" 60 && rm -f "$RTK_LOCK"
+  if cache_is_stale "$RTK_CACHE" 300 && [ ! -f "$RTK_LOCK" ]; then
     (
       touch "$RTK_LOCK"
       # Use awk to get a clean integer from sqlite3 (strips newlines, handles empty)
@@ -193,7 +175,7 @@ if [ -f "$RTK_DB" ] && command -v sqlite3 &>/dev/null; then
 fi
 
 # ── Build colored context progress bar ──
-BAR_WIDTH=12
+BAR_WIDTH=14
 FILLED=$(bar_filled "$PCT" "$BAR_WIDTH")
 EMPTY=$((BAR_WIDTH - FILLED))
 BAR_COLOR="\033[$(bar_color_code "$PCT")m"
@@ -214,17 +196,9 @@ else
   STATUS="${BAR_COLOR}● ${STATUS_TEXT}${RESET}"
 fi
 
-# ── GitHub prefix ──
+# ── GitHub prefix (dimmed — reference info, not actionable) ──
 GH_PREFIX=""
-[ -n "$GH_USER" ] && GH_PREFIX="@${GH_USER} | "
-
-# ── API org total (from Admin API cache, rounded for display) ──
-API_TOTAL_RAW=$(cat "$HOME/.claude/.api_cost_cache" 2>/dev/null | tr -d '[:space:]')
-if [ -n "$API_TOTAL_RAW" ]; then
-  API_TOTAL=$(echo "$API_TOTAL_RAW" | awk '{printf "%d", $1}')
-else
-  API_TOTAL="?"
-fi
+[ -n "$GH_USER" ] && GH_PREFIX="${DIM}@${GH_USER}${RESET}"
 
 # ── Burn rate ($/min for current session) ──
 BURN_RATE=$(burn_rate "$SESSION_COST" "$SESSION_DURATION_MS")
@@ -241,33 +215,58 @@ DIM_SEP="\033[2m"
 
 # ── RTK savings segment (green, only if non-empty) ──
 RTK_SEGMENT=""
-[ -n "$RTK_SAVED" ] && RTK_SEGMENT="  ${GREEN}↓${RTK_SAVED}${RESET} ${DIM}rtk${RESET}"
+RTK_STALE_MARKER=$(stale_marker "$RTK_CACHE" 300)
+[ -n "$RTK_SAVED" ] && RTK_SEGMENT="${GREEN}↓${RTK_SAVED}${RTK_STALE_MARKER}${RESET} ${DIM}rtk${RESET}"
 
-# ── Output to statusline (two rows) ──
-# Row 1: user | model | [colored bar] pct% | health status
-#   Dim pipes for structure, data stands out
-# Row 2: color-coded by importance
-#   dim=reference, bold=session cost, cyan=today, yellow=MTD, green=rtk savings
-ROW1="${DIM}@${RESET}${GH_USER} ${DIM}|${RESET} ${MODEL} ${DIM}|${RESET} ${BAR} ${PCT}%% ${DIM}|${RESET} ${STATUS}"
-[ -z "$GH_USER" ] && ROW1="${MODEL} ${DIM}|${RESET} ${BAR} ${PCT}%% ${DIM}|${RESET} ${STATUS}"
+# ── Staleness markers for cache-backed fields ──
+TODAY_STALE=$(stale_marker "$CLYTICS_CACHE" 60)
 
-ROW2="${DIM}\$${COST_PER_1K}/1k · ${TOKEN_DISPLAY}/${CTX_LIMIT_K}${RESET}"
-ROW2="${ROW2}  ${WHITE}\$${SESSION_COST_SHORT}${RESET} ${DIM}sesh${RESET} ${DIM}·${RESET} ${DIM}\$${BURN_RATE}/min${RESET}"
+# ── Output to statusline ──
+# Row 1: identity │ model │ [bar] pct% │ health   (identity dimmed, bar+status bright)
+# Row 2: rate zone ─ session zone                  (session cost bold white)
+# Row 3: spend zone ─ savings/alert zone           (color-coded by concern level)
+# Row 4: astra agents ─ workflow ─ events          (conditional, dim reference)
 
-ROW3="${CYAN}\$${TODAY_COST}${RESET} ${DIM}today${RESET} ${DIM}·${RESET} ${YELLOW}\$${CLYTICS_TOTAL}${RESET} ${DIM}CC${RESET} ${DIM}·${RESET} ${DIM}\$${API_TOTAL} org${RESET}"
-ROW3="${ROW3}${RTK_SEGMENT}${COST_ALERT}"
+# ── Opus guard: flag if Opus active without Commander workflow ──
+ASTRA_DIR="$HOME/.astra"
+MODEL_SEGMENT="${DIM}${MODEL}${RESET}"
+OPUS_BADGE=""
+case "$MODEL" in
+  *Opus*|*opus*)
+    WF_ACTIVE=""
+    if [ -n "$SESSION_ID" ] && [ -f "$ASTRA_DIR/workflow/${SESSION_ID}.json" ]; then
+      WF_ACTIVE=$(jq -r '.status // ""' "$ASTRA_DIR/workflow/${SESSION_ID}.json" 2>/dev/null)
+    fi
+    if [ "$WF_ACTIVE" = "executing" ]; then
+      MODEL_SEGMENT="\033[35;1m${MODEL}\033[0m"
+    else
+      MODEL_SEGMENT="\033[41;37;1m ⚠ ${MODEL} \033[0m"
+      OPUS_BADGE="\033[31;1m OPUS-NO-CMDR \033[0m"
+    fi
+    ;;
+esac
+
+ROW1="${GH_PREFIX} ${DIM}│${RESET} ${MODEL_SEGMENT} ${DIM}│${RESET} ${BAR} ${BAR_COLOR}${PCT}%%${RESET} ${DIM}│${RESET} ${STATUS}${OPUS_BADGE}"
+[ -z "$GH_USER" ] && ROW1="${MODEL_SEGMENT} ${DIM}│${RESET} ${BAR} ${BAR_COLOR}${PCT}%%${RESET} ${DIM}│${RESET} ${STATUS}${OPUS_BADGE}"
+
+ROW2="  ${DIM}\$${COST_PER_1K}/1k · ${TOKEN_DISPLAY}/${CTX_LIMIT_K}${RESET}"
+ROW2="${ROW2}  ${DIM}─${RESET}  ${WHITE}\$${SESSION_COST_SHORT}${RESET} ${DIM}sesh${RESET} ${DIM}·${RESET} ${DIM}\$${BURN_RATE}/min${RESET}"
+
+ROW3="  ${CYAN}\$${TODAY_COST}${TODAY_STALE}${RESET} ${DIM}today${RESET} ${DIM}·${RESET} ${YELLOW}\$${CC_MTD_INT}${RESET} ${DIM}key${RESET} ${DIM}·${RESET} ${DIM}\$${CLYTICS_TOTAL}${TODAY_STALE}${RESET} ${DIM}all${RESET}"
+if [ -n "$RTK_SEGMENT" ] || [ -n "$COST_ALERT" ]; then
+  ROW3="${ROW3}  ${DIM}─${RESET}  ${RTK_SEGMENT}${COST_ALERT}"
+fi
 
 printf "${ROW1}\n${ROW2}\n${ROW3}\n"
 
 # ── Astra Agent SDK row (ROW3) ──
-ASTRA_DIR="$HOME/.astra"
 ASTRA_ROW=""
 
 # Registry summary
 if [ -f "$ASTRA_DIR/registry.json" ]; then
   ASTRA_AGENTS=$(jq -r '.agentCount // ""' "$ASTRA_DIR/registry.json" 2>/dev/null)
   ASTRA_DIVS=$(jq -r '.divisionCount // ""' "$ASTRA_DIR/registry.json" 2>/dev/null)
-  [ -n "$ASTRA_AGENTS" ] && ASTRA_ROW="${DIM}⬡ ${ASTRA_AGENTS} agents/${ASTRA_DIVS} div${RESET}"
+  [ -n "$ASTRA_AGENTS" ] && ASTRA_ROW="  ${DIM}⬡ ${ASTRA_AGENTS} agents/${ASTRA_DIVS} div${RESET}"
 fi
 
 # Workflow state
@@ -286,7 +285,7 @@ if [ -n "$SESSION_ID" ] && [ -f "$ASTRA_DIR/workflow/${SESSION_ID}.json" ]; then
       *)          WF_COLOR="\033[2m" ;;
     esac
     WF_SEGMENT="${WF_COLOR}◆ ${WORKFLOW_STATUS}${PHASE_LABEL}${RESET}"
-    ASTRA_ROW="${ASTRA_ROW}  ${WF_SEGMENT}"
+    ASTRA_ROW="${ASTRA_ROW}  ${DIM}─${RESET}  ${WF_SEGMENT}"
   fi
 fi
 
@@ -299,55 +298,55 @@ if [ -f "$EVENTS_FILE" ]; then
   EVENT_COUNT=$(wc -l < "$EVENTS_FILE" 2>/dev/null | tr -d '[:space:]')
   EVENT_COUNT="${EVENT_COUNT:-0}"
   [ "$ERROR_COUNT" -gt 0 ] \
-    && ASTRA_ROW="${ASTRA_ROW}  \033[31m✗ ${ERROR_COUNT} err${RESET}" \
-    || ASTRA_ROW="${ASTRA_ROW}  ${DIM}${EVENT_COUNT} events${RESET}"
+    && ASTRA_ROW="${ASTRA_ROW}  ${DIM}─${RESET}  \033[31m✗ ${ERROR_COUNT} err${RESET}" \
+    || ASTRA_ROW="${ASTRA_ROW}  ${DIM}─${RESET}  ${DIM}${EVENT_COUNT} events${RESET}"
 fi
 
 [ -n "$ASTRA_ROW" ] && printf "${ASTRA_ROW}\n"
 
-# ── Write to Obsidian vault ──
-if [ -n "$OBSIDIAN_VAULT" ] && [ -d "$OBSIDIAN_VAULT" ]; then
-  OBSIDIAN_DIR="${OBSIDIAN_VAULT}/Claude Sessions"
-  mkdir -p "$OBSIDIAN_DIR"
-
-  DATE=$(date +"%Y-%m-%d")
-  TIME=$(date +"%H:%M:%S")
-  OBSIDIAN_FILE="${OBSIDIAN_DIR}/Claude Sessions — ${DATE}.md"
-
-  # Create file with header if it doesn't exist
-  if [ ! -f "$OBSIDIAN_FILE" ]; then
-    cat > "$OBSIDIAN_FILE" << EOF
-# Claude Code Sessions — ${DATE}
-
-> Auto-generated by Claude Code statusline. Updates in real-time.
-
-## Today's Summary
-
-| Time | Model | Context% | \$/1k tokens | Session \$ | Tokens | Git Branch | Status |
-|------|-------|----------|-------------|-----------|--------|------------|--------|
-EOF
-  fi
-
-  # Get git branch if available
-  GIT_BRANCH=$(git -C "$(echo "$input" | jq -r '.workspace.current_dir // "."')" branch --show-current 2>/dev/null || echo "—")
-
-  # Plaintext status for Obsidian (no ANSI)
-  OBS_STATUS=$(status_label "$PCT")
-
-  # Append new row (avoids duplicate timestamps by checking last line)
-  LAST_TIME=$(tail -1 "$OBSIDIAN_FILE" | grep -o "^| [0-9:]*" | tr -d '| ')
-  if [ "$LAST_TIME" != "$TIME" ]; then
-    echo "| $TIME | $MODEL | ${PCT}% | \$$COST_PER_1K | \$$SESSION_COST_FMT | ~$TOKEN_DISPLAY | $GIT_BRANCH | $OBS_STATUS |" >> "$OBSIDIAN_FILE"
-  fi
-
-  # Update footer in-place (fixes blank-line accumulation bug from grep-v approach)
-  # Use @ as sed delimiter (avoids conflict with | in footer text)
-  FOOTER_LINE="**Claude Code Total (month-to-date):** \$${CLYTICS_TOTAL}  **Today:** \$${TODAY_COST}"
-  if grep -q "^\*\*Claude Code Total" "$OBSIDIAN_FILE" 2>/dev/null; then
-    sed -i '' "s@^\*\*Claude Code Total.*@${FOOTER_LINE}@" "$OBSIDIAN_FILE" 2>/dev/null || \
-    sed -i "s@^\*\*Claude Code Total.*@${FOOTER_LINE}@" "$OBSIDIAN_FILE" 2>/dev/null
-  else
-    echo "" >> "$OBSIDIAN_FILE"
-    echo "$FOOTER_LINE" >> "$OBSIDIAN_FILE"
-  fi
+# ── Unified state file (single truth for all consumers) ──
+STATE_FILE="$HOME/.claude/.statusline_state.json"
+if command -v jq &>/dev/null; then
+  jq -n \
+    --argjson ts "$(date +%s)" \
+    --arg sid "$SESSION_ID" \
+    --argjson pct "${PCT:-0}" \
+    --argjson remaining "$((100 - ${PCT:-0}))" \
+    --argjson used_tokens "${USED_TOKENS:-0}" \
+    --argjson ctx_size "${CTX_SIZE:-200000}" \
+    --arg health "$(status_label "${PCT:-0}")" \
+    --arg model "$MODEL" \
+    --arg gh_user "$GH_USER" \
+    --arg session_cost "${SESSION_COST:-0}" \
+    --arg cost_per_1k "$COST_PER_1K" \
+    --arg burn_rate "$BURN_RATE" \
+    --arg today_cost "$TODAY_COST" \
+    --arg cc_mtd "$CC_MTD" \
+    --arg cc_alltime "$CLYTICS_TOTAL" \
+    --arg rtk_saved "${RTK_SAVED:-}" \
+    --argjson astra_agents "${ASTRA_AGENTS:-0}" \
+    --argjson astra_divs "${ASTRA_DIVS:-0}" \
+    --arg workflow_status "${WORKFLOW_STATUS:-idle}" \
+    --argjson event_count "${EVENT_COUNT:-0}" \
+    --argjson error_count "${ERROR_COUNT:-0}" \
+    --argjson gh_age "$(cache_age "$GH_CACHE")" \
+    --argjson today_age "$(cache_age "$CLYTICS_CACHE")" \
+    --argjson rtk_age "$(cache_age "$RTK_CACHE")" \
+    '{
+      version: 1,
+      timestamp: $ts,
+      session_id: $sid,
+      context: { used_pct: $pct, remaining_pct: $remaining, used_tokens: $used_tokens, ctx_size: $ctx_size, health: $health },
+      cost: { session_usd: $session_cost, cost_per_1k: $cost_per_1k, burn_rate_min: $burn_rate, today_usd: $today_cost, cc_key_mtd_usd: $cc_mtd, cc_alltime_usd: $cc_alltime },
+      identity: { model: $model, gh_user: $gh_user },
+      astra: { agent_count: $astra_agents, division_count: $astra_divs, workflow_status: $workflow_status, event_count: $event_count, error_count: $error_count },
+      rtk: { saved_today: $rtk_saved },
+      freshness: {
+        gh_user:    { age_s: $gh_age,    max_s: 3600, fresh: ($gh_age < 3600) },
+        today_cost: { age_s: $today_age, max_s: 60,   fresh: ($today_age < 60) },
+        rtk_saved:  { age_s: $rtk_age,   max_s: 300,  fresh: ($rtk_age < 300) }
+      }
+    }' > "$STATE_FILE" 2>/dev/null
 fi
+
+# Vault writes handled by SessionEnd hook (session-logger-worker.js).

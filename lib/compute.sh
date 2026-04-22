@@ -106,3 +106,31 @@ token_or_fallback() {
     echo "${tokens:-0}"
   fi
 }
+
+# ── Cache middleware ──────────────────────────────────────────────────
+
+# cache_age: file age in seconds (999999 if missing)
+# Args: $1 = cache file path
+cache_age() {
+  [ ! -f "$1" ] && echo "999999" && return
+  local mtime now
+  mtime=$(stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0)
+  now=$(date +%s)
+  echo $((now - mtime))
+}
+
+# cache_is_stale: exit 0 if stale, exit 1 if fresh
+# Args: $1 = cache file, $2 = max stale seconds
+cache_is_stale() {
+  local age
+  age=$(cache_age "$1")
+  [ "$age" -gt "$2" ] 2>/dev/null
+}
+
+# stale_marker: returns dim "?" if stale, empty if fresh
+# Args: $1 = cache file, $2 = max stale seconds
+stale_marker() {
+  if cache_is_stale "$1" "$2"; then
+    printf '\033[2m?\033[0m'
+  fi
+}

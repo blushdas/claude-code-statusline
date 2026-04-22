@@ -1,20 +1,22 @@
 # claude-code-statusline
 
-A real-time statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that tracks context usage, costs, and optionally logs sessions to Obsidian.
+A real-time statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that tracks context usage, costs, and model discipline.
 
 ## What It Shows
 
 ```
-@user | Claude 4 Opus | ████████░░░░ 67% | ● ATTENTION
-$0.0031/1k · 67.3k/200k  $0.29 sesh · $0.42/min  $118 today · $291 CC · $371 org  ↓978k rtk
+@user | Sonnet 4.6 | ████████░░░░ 67% | ● ATTENTION
+$0.0031/1k · 67.3k/200k  $0.29 sesh · $0.42/min  $118 today · $291 key · $2054 all  ↓978k rtk
 ```
 
-**Row 1:** GitHub username · model name · context bar · health status
+When Opus is active without a Commander workflow, the model name flips to a red-background warning and a `OPUS-NO-CMDR` badge appears after the health indicator.
+
+**Row 1:** GitHub username · model name (Opus guard) · context bar · health status
 
 **Row 2** (grouped left-to-right, micro → macro):
 - **Rate:** `$/1k tokens · tokens used/limit` — efficiency at a glance
 - **Session:** `$ session · $/min burn rate` — what this session is costing
-- **Aggregates:** `$ today · $ CC (month-to-date) · $ org (Admin API)` — bigger picture
+- **Aggregates:** `$ today · $ key (month-to-date) · $ all (lifetime)` — bigger picture
 - **RTK savings:** `↓Xk rtk` — tokens saved today by RTK compression (optional, if RTK installed)
 
 **Row 3** (optional): Astra Agent SDK status — agent count, workflow state, error count
@@ -23,13 +25,13 @@ $0.0031/1k · 67.3k/200k  $0.29 sesh · $0.42/min  $118 today · $291 CC · $371
 
 - **Context rot tracking** — visual progress bar with color-coded health warnings (5 tiers)
 - **Real-time cost** — per-1k-token rate, session total, and burn rate ($/min)
-- **Today's cost** — live daily spend pulled from claudelytics (cached 5 min, background refresh)
-- **CC spend** — per-key month-to-date cost tracked locally from Claude Code sessions
-- **Org spend** — total Anthropic API spend via Admin API (optional, cached hourly)
+- **Today's cost** — live daily spend pulled from claudelytics (cached 60s, background refresh)
+- **Key MTD** — per-key month-to-date cost tracked locally from Claude Code sessions
+- **Lifetime total** — cumulative spend across all sessions (from claudelytics)
+- **Opus guard** — red warning when Opus is active without a Commander workflow executing
 - **RTK integration** — today's token savings from RTK compression (optional, background refresh)
 - **GitHub identity** — shows your `@username` from `gh` CLI
 - **Cost alerts** — `⚠ $X.XXXX BURN` at $3+ (red), `⚠ BURN` badge at $5+ (red background)
-- **Obsidian logging** — auto-generates daily session tables (optional)
 
 ## Quick Install
 
@@ -76,8 +78,6 @@ All configuration is via environment variables. Add these to your `.zshrc` / `.b
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `OBSIDIAN_VAULT` | No | Path to your Obsidian vault for session logging |
-| `ANTHROPIC_ADMIN_API_KEY` | No | Admin API key for org-wide spend tracking |
 | `ANTHROPIC_BILLING_START_DAY` | No | Day of month your billing cycle starts (default: 01) |
 | `CLAUDE_STATUSLINE_DEBUG` | No | Set to `1` for diagnostic logs at `~/.claude/.statusline_debug.log` |
 
@@ -85,8 +85,6 @@ All configuration is via environment variables. Add these to your `.zshrc` / `.b
 
 ```bash
 # Claude Code Statusline
-export OBSIDIAN_VAULT="$HOME/Documents/MyVault"
-export ANTHROPIC_ADMIN_API_KEY="sk-ant-admin01-..."
 export ANTHROPIC_BILLING_START_DAY="15"
 ```
 
@@ -96,8 +94,7 @@ export ANTHROPIC_BILLING_START_DAY="15"
 |------|----------|---------|
 | `jq` | **Yes** | JSON parsing |
 | `gh` | Yes (soft) | GitHub username display |
-| `curl` | For org spend | Anthropic Admin API calls |
-| `claudelytics` | No | Today's cost display (background, cached 5 min) |
+| `claudelytics` | No | Today's cost + lifetime total (background, cached 60s) |
 | `sqlite3` | No | RTK savings display (background, cached 5 min) |
 
 No `bc` required — all float math uses `awk`.
@@ -124,15 +121,15 @@ Each number in Row 2 comes from a different source:
 | `tokens/limit` | Claude Code JSON pipe | Real-time |
 | `$ session` | Claude Code JSON pipe | Real-time |
 | `$/min` | Calculated from session cost + duration | Real-time |
-| `$ today` | claudelytics → JSONL files | 5 min cache |
-| `$ CC` | Local accumulator (`.cc_sessions.json`) | Per-tick |
-| `$ org` | Anthropic Admin API cache | 1 hour cache |
+| `$ today` | claudelytics → JSONL files | 60s cache |
+| `$ key` | Local accumulator (`.cc_sessions.json`) | Per-tick |
+| `$ all` | claudelytics lifetime total | 60s cache |
 | `↓Xk rtk` | RTK SQLite DB | 5 min cache |
 
 **Why do the numbers differ?** Each uses a different methodology:
-- **CC** = sum of peak costs per session, tracked locally since statusline was installed
-- **today** = recalculated from token counts in JSONL files by claudelytics (most accurate)
-- **org** = Anthropic's billing API, includes all API usage (not just Claude Code)
+- **key** = sum of peak costs per session, tracked locally since statusline was installed (per-key MTD)
+- **today** = recalculated from token counts in JSONL files by claudelytics (most accurate for the day)
+- **all** = lifetime total across every transcript claudelytics has seen
 
 ## Persistent Files
 
@@ -143,40 +140,21 @@ All state is stored in `~/.claude/`:
 | `.cc_sessions.json` | Peak cost per session (billing MTD) | Monthly reset |
 | `.cc_billing_month` | Current billing YYYYMM | Monthly |
 | `.gh_user_cache` | GitHub username | 60 min |
-| `.api_cost_cache` | Org-wide Admin API cost | 1 hour |
-| `.claudelytics_today_cache` | Today's cost from claudelytics | 5 min |
+| `.claudelytics_today_cache` | Today's cost from claudelytics | 60s |
+| `.claudelytics_total_cache` | Lifetime total from claudelytics | 60s |
 | `.rtk_today_cache` | RTK savings today | 5 min |
+| `.statusline_state.json` | Unified state snapshot (consumed by hooks) | Per-tick |
 
-## Obsidian Integration
+## Opus Guard
 
-When `OBSIDIAN_VAULT` is set, the statusline creates daily notes at:
+The statusline flags Opus usage so you don't get a surprise bill.
 
-```
-{OBSIDIAN_VAULT}/Claude Sessions/Claude Sessions — 2025-03-15.md
-```
+- **Opus + Commander workflow executing** → model name rendered in bold magenta (acceptable: Opus is doing planning/dispatch work)
+- **Opus + no Commander workflow** → model name flipped to white-on-red `⚠ Opus X.X ` and a red `OPUS-NO-CMDR` badge appears after the health indicator
 
-Each note contains a live-updating table:
+The guard checks for a workflow state file at `~/.astra/workflow/<session_id>.json` with `status: "executing"`. If that's not present, Opus usage is treated as undisciplined.
 
-| Time | Model | Context% | $/1k tokens | Session $ | Tokens | Git Branch | Status |
-|------|-------|----------|-------------|-----------|--------|------------|--------|
-| 14:22:01 | Claude 4 Opus | 23% | $0.0029 | $0.04 | ~14k | main | healthy |
-
-Plus a footer with month-to-date API spend and today's total.
-
-## API Spend Tracking
-
-To track your total Anthropic API spend:
-
-1. Go to [console.anthropic.com/settings/admin-keys](https://console.anthropic.com/settings/admin-keys)
-2. Create an Admin API key
-3. Set `ANTHROPIC_ADMIN_API_KEY` in your shell profile
-
-The installer can also set up a **hourly launchd daemon** (macOS) to refresh the org cost cache in the background.
-
-Test your API key setup:
-```bash
-bash ~/.claude/statusline.sh --test-api
-```
+Pair with a matching `UserPromptSubmit` hook to print an inline warning on every prompt.
 
 ## Troubleshooting
 

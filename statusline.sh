@@ -34,7 +34,10 @@ CTX_SIZE=$(echo "$input" | jq -r '.context_window.context_window_size // 200000'
 SESSION_COST=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
 SESSION_DURATION_MS=$(echo "$input" | jq -r '.cost.total_duration_ms // 0')
 
-# ── Token count (sum all types) ──
+# ── Token count (sum all types) + raw cache fields for hit % ──
+CACHE_READ=$(echo "$input" | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
+CACHE_CREATE=$(echo "$input" | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
+INPUT_RAW=$(echo "$input" | jq -r '.context_window.current_usage.input_tokens // 0')
 USED_TOKENS=$(echo "$input" | jq -r '
   ((.context_window.current_usage.input_tokens // 0) +
    (.context_window.current_usage.cache_creation_input_tokens // 0) +
@@ -46,6 +49,12 @@ USED_TOKENS=$(echo "$input" | jq -r '
 # used_percentage includes system prompt + tools + memory + conversation.
 # current_usage only counts conversation tokens from model turns.
 USED_TOKENS=$(token_or_fallback "$USED_TOKENS" "$PCT" "$CTX_SIZE")
+
+# ── Cache hit percentage (suppressed when 0 — no noise at session start) ──
+CACHE_HIT_PCT=$(cache_hit_pct "$CACHE_READ" "$CACHE_CREATE" "$INPUT_RAW")
+
+# ── Git branch (current working directory) ──
+GIT_BRANCH=$(git branch --show-current 2>/dev/null | head -1)
 
 # ── Context bridge for gsd-context-monitor.js ──
 if [ -n "$SESSION_ID" ]; then
@@ -245,10 +254,18 @@ case "$MODEL" in
     ;;
 esac
 
-ROW1="${GH_PREFIX} ${DIM}│${RESET} ${MODEL_SEGMENT} ${DIM}│${RESET} ${BAR} ${BAR_COLOR}${PCT}%%${RESET} ${DIM}│${RESET} ${STATUS}${OPUS_BADGE}"
-[ -z "$GH_USER" ] && ROW1="${MODEL_SEGMENT} ${DIM}│${RESET} ${BAR} ${BAR_COLOR}${PCT}%%${RESET} ${DIM}│${RESET} ${STATUS}${OPUS_BADGE}"
+# ── Git branch segment (dim, only if inside a repo) ──
+BRANCH_SEGMENT=""
+[ -n "$GIT_BRANCH" ] && BRANCH_SEGMENT=" ${DIM}│${RESET} ${DIM}${GIT_BRANCH}${RESET}"
 
-ROW2="  ${DIM}\$${COST_PER_1K}/1k · ${TOKEN_DISPLAY}/${CTX_LIMIT_K}${RESET}"
+ROW1="${GH_PREFIX} ${DIM}│${RESET} ${MODEL_SEGMENT} ${DIM}│${RESET} ${BAR} ${BAR_COLOR}${PCT}%%${RESET} ${DIM}│${RESET} ${STATUS}${OPUS_BADGE}${BRANCH_SEGMENT}"
+[ -z "$GH_USER" ] && ROW1="${MODEL_SEGMENT} ${DIM}│${RESET} ${BAR} ${BAR_COLOR}${PCT}%%${RESET} ${DIM}│${RESET} ${STATUS}${OPUS_BADGE}${BRANCH_SEGMENT}"
+
+# ── Cache hit segment (cyan, only if >0%; %% for printf safety) ──
+CACHE_SEGMENT=""
+[ -n "$CACHE_HIT_PCT" ] && CACHE_SEGMENT=" ${DIM}·${RESET} ${CYAN}${CACHE_HIT_PCT}%%${RESET} ${DIM}cache${RESET}"
+
+ROW2="  ${DIM}\$${COST_PER_1K}/1k · ${TOKEN_DISPLAY}/${CTX_LIMIT_K}${RESET}${CACHE_SEGMENT}"
 ROW2="${ROW2}  ${DIM}─${RESET}  ${WHITE}\$${SESSION_COST_SHORT}${RESET} ${DIM}sesh${RESET} ${DIM}·${RESET} ${DIM}\$${BURN_RATE}/min${RESET}"
 
 ROW3="  ${CYAN}\$${TODAY_COST}${TODAY_STALE}${RESET} ${DIM}today${RESET} ${DIM}·${RESET} ${YELLOW}\$${CC_MTD_INT}${RESET} ${DIM}key${RESET} ${DIM}·${RESET} ${DIM}\$${CLYTICS_TOTAL}${TODAY_STALE}${RESET} ${DIM}all${RESET}"
@@ -331,13 +348,15 @@ if command -v jq &>/dev/null; then
     --argjson gh_age "$(cache_age "$GH_CACHE")" \
     --argjson today_age "$(cache_age "$CLYTICS_CACHE")" \
     --argjson rtk_age "$(cache_age "$RTK_CACHE")" \
+    --arg cache_hit_pct "${CACHE_HIT_PCT:-}" \
+    --arg git_branch "${GIT_BRANCH:-}" \
     '{
       version: 1,
       timestamp: $ts,
       session_id: $sid,
-      context: { used_pct: $pct, remaining_pct: $remaining, used_tokens: $used_tokens, ctx_size: $ctx_size, health: $health },
+      context: { used_pct: $pct, remaining_pct: $remaining, used_tokens: $used_tokens, ctx_size: $ctx_size, health: $health, cache_hit_pct: $cache_hit_pct },
       cost: { session_usd: $session_cost, cost_per_1k: $cost_per_1k, burn_rate_min: $burn_rate, today_usd: $today_cost, cc_key_mtd_usd: $cc_mtd, cc_alltime_usd: $cc_alltime },
-      identity: { model: $model, gh_user: $gh_user },
+      identity: { model: $model, gh_user: $gh_user, git_branch: $git_branch },
       astra: { agent_count: $astra_agents, division_count: $astra_divs, workflow_status: $workflow_status, event_count: $event_count, error_count: $error_count },
       rtk: { saved_today: $rtk_saved },
       freshness: {

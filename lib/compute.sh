@@ -115,6 +115,20 @@ token_or_fallback() {
   fi
 }
 
+# ── Cache hit percentage ──
+# Args: $1=cache_read_tokens, $2=cache_creation_tokens, $3=input_tokens
+# Output: integer (e.g. "87") or "" if 0 — no "%" suffix (caller adds %% for printf safety)
+cache_hit_pct() {
+  local cr="$1" cc="$2" inp="$3"
+  awk -v cr="$cr" -v cc="$cc" -v inp="$inp" 'BEGIN {
+    total = cr + cc + inp;
+    if (total == 0) { print ""; exit }
+    pct = int(cr / total * 100);
+    if (pct == 0) { print ""; exit }
+    printf "%d", pct
+  }'
+}
+
 # ── Cache middleware ──────────────────────────────────────────────────
 
 # cache_age: file age in seconds (999999 if missing)

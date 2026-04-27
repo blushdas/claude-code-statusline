@@ -152,23 +152,18 @@ fi
 RTK_DB="$HOME/Library/Application Support/rtk/history.db"
 RTK_CACHE="$HOME/.claude/.rtk_today_cache"
 RTK_LOCK="$HOME/.claude/.rtk_refreshing"
-RTK_SAVED=""
-[ -f "$RTK_CACHE" ] && RTK_SAVED=$(cat "$RTK_CACHE" 2>/dev/null)
+RTK_RAW=""
+[ -f "$RTK_CACHE" ] && RTK_RAW=$(cat "$RTK_CACHE" 2>/dev/null | awk 'NR==1{print int($1+0)}')
 
 if [ -f "$RTK_DB" ] && command -v sqlite3 &>/dev/null; then
   # Auto-clean stale lock (crashed refresh)
   [ -f "$RTK_LOCK" ] && cache_is_stale "$RTK_LOCK" 60 && rm -f "$RTK_LOCK"
-  if cache_is_stale "$RTK_CACHE" 300 && [ ! -f "$RTK_LOCK" ]; then
+  if cache_is_stale "$RTK_CACHE" 60 && [ ! -f "$RTK_LOCK" ]; then
     (
       touch "$RTK_LOCK"
-      # Use awk to get a clean integer from sqlite3 (strips newlines, handles empty)
       saved=$(sqlite3 "$RTK_DB" "SELECT COALESCE(SUM(saved_tokens),0) FROM commands WHERE date(timestamp,'localtime')=date('now','localtime')" 2>/dev/null | awk 'NR==1{print int($1+0)}')
       saved="${saved:-0}"
-      if [ "$saved" -gt 0 ] 2>/dev/null; then
-        rtk_format "$saved" > "$RTK_CACHE"
-      else
-        echo "" > "$RTK_CACHE"
-      fi
+      echo "$saved" > "$RTK_CACHE"
       rm -f "$RTK_LOCK"
     ) &
   fi
@@ -215,8 +210,12 @@ DIM_SEP="\033[2m"
 
 # ── RTK savings segment (green, only if non-empty) ──
 RTK_SEGMENT=""
-RTK_STALE_MARKER=$(stale_marker "$RTK_CACHE" 300)
-[ -n "$RTK_SAVED" ] && RTK_SEGMENT="${GREEN}↓${RTK_SAVED}${RTK_STALE_MARKER}${RESET} ${DIM}rtk${RESET}"
+RTK_STALE_MARKER=$(stale_marker "$RTK_CACHE" 60)
+if [ -n "$RTK_RAW" ] && [ "$RTK_RAW" -gt 0 ] 2>/dev/null; then
+  RTK_FMT=$(rtk_format "$RTK_RAW")
+  RTK_DOLLARS=$(rtk_dollars "$RTK_RAW")
+  RTK_SEGMENT="${GREEN}↓${RTK_FMT} ${RTK_DOLLARS}${RTK_STALE_MARKER}${RESET} ${DIM}rtk${RESET}"
+fi
 
 # ── Staleness markers for cache-backed fields ──
 TODAY_STALE=$(stale_marker "$CLYTICS_CACHE" 60)

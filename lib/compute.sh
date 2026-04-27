@@ -36,6 +36,14 @@ rtk_format() {
   }'
 }
 
+# ── RTK savings → dollar cost saved ──
+# Args: $1 = saved tokens (integer)
+# Output: "$X.XX" at Sonnet 4.6 input rate ($3/1M tokens)
+rtk_dollars() {
+  local tokens="$1"
+  awk -v n="$tokens" 'BEGIN{d=n*0.000003; if(d<0.01) printf "$%.3f",d; else printf "$%.2f",d}'
+}
+
 # ── Bar fill count ──
 # Args: $1 = pct (0-100 integer), $2 = width (default 12)
 # Output: number of filled chars

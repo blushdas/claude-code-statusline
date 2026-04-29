@@ -53,8 +53,10 @@ USED_TOKENS=$(token_or_fallback "$USED_TOKENS" "$PCT" "$CTX_SIZE")
 # ── Cache hit percentage (suppressed when 0 — no noise at session start) ──
 CACHE_HIT_PCT=$(cache_hit_pct "$CACHE_READ" "$CACHE_CREATE" "$INPUT_RAW")
 
-# ── Git branch (current working directory) ──
+# ── Git context (branch, repo name, short commit) ──
 GIT_BRANCH=$(git branch --show-current 2>/dev/null | head -1)
+GIT_REPO=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null)
+GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null)
 
 # ── Context bridge for gsd-context-monitor.js ──
 if [ -n "$SESSION_ID" ]; then
@@ -254,12 +256,16 @@ case "$MODEL" in
     ;;
 esac
 
-# ── Git branch segment (dim, only if inside a repo) ──
-BRANCH_SEGMENT=""
-[ -n "$GIT_BRANCH" ] && BRANCH_SEGMENT=" ${DIM}│${RESET} ${DIM}${GIT_BRANCH}${RESET}"
+# ── Git info row (repo │ branch │ commit — dim, only if inside a repo) ──
+GIT_ROW=""
+if [ -n "$GIT_REPO" ] || [ -n "$GIT_BRANCH" ]; then
+  GIT_ROW="  ${DIM}${GIT_REPO}${RESET}"
+  [ -n "$GIT_BRANCH" ] && GIT_ROW="${GIT_ROW} ${DIM}│${RESET} ${DIM}${GIT_BRANCH}${RESET}"
+  [ -n "$GIT_COMMIT" ] && GIT_ROW="${GIT_ROW} ${DIM}│${RESET} ${DIM}${GIT_COMMIT}${RESET}"
+fi
 
-ROW1="${GH_PREFIX} ${DIM}│${RESET} ${MODEL_SEGMENT} ${DIM}│${RESET} ${BAR} ${BAR_COLOR}${PCT}%%${RESET} ${DIM}│${RESET} ${STATUS}${OPUS_BADGE}${BRANCH_SEGMENT}"
-[ -z "$GH_USER" ] && ROW1="${MODEL_SEGMENT} ${DIM}│${RESET} ${BAR} ${BAR_COLOR}${PCT}%%${RESET} ${DIM}│${RESET} ${STATUS}${OPUS_BADGE}${BRANCH_SEGMENT}"
+ROW1="${GH_PREFIX} ${DIM}│${RESET} ${MODEL_SEGMENT} ${DIM}│${RESET} ${BAR} ${BAR_COLOR}${PCT}%%${RESET} ${DIM}│${RESET} ${STATUS}${OPUS_BADGE}"
+[ -z "$GH_USER" ] && ROW1="${MODEL_SEGMENT} ${DIM}│${RESET} ${BAR} ${BAR_COLOR}${PCT}%%${RESET} ${DIM}│${RESET} ${STATUS}${OPUS_BADGE}"
 
 # ── Cache hit segment (cyan, only if >0%; %% for printf safety) ──
 CACHE_SEGMENT=""
@@ -273,7 +279,9 @@ if [ -n "$RTK_SEGMENT" ] || [ -n "$COST_ALERT" ]; then
   ROW3="${ROW3}  ${DIM}─${RESET}  ${RTK_SEGMENT}${COST_ALERT}"
 fi
 
-printf "${ROW1}\n${ROW2}\n${ROW3}\n"
+printf "${ROW1}\n"
+[ -n "$GIT_ROW" ] && printf "${GIT_ROW}\n"
+printf "${ROW2}\n${ROW3}\n"
 
 # ── Astra Agent SDK row (ROW3) ──
 ASTRA_ROW=""
@@ -350,13 +358,15 @@ if command -v jq &>/dev/null; then
     --argjson rtk_age "$(cache_age "$RTK_CACHE")" \
     --arg cache_hit_pct "${CACHE_HIT_PCT:-}" \
     --arg git_branch "${GIT_BRANCH:-}" \
+    --arg git_repo "${GIT_REPO:-}" \
+    --arg git_commit "${GIT_COMMIT:-}" \
     '{
       version: 1,
       timestamp: $ts,
       session_id: $sid,
       context: { used_pct: $pct, remaining_pct: $remaining, used_tokens: $used_tokens, ctx_size: $ctx_size, health: $health, cache_hit_pct: $cache_hit_pct },
       cost: { session_usd: $session_cost, cost_per_1k: $cost_per_1k, burn_rate_min: $burn_rate, today_usd: $today_cost, cc_key_mtd_usd: $cc_mtd, cc_alltime_usd: $cc_alltime },
-      identity: { model: $model, gh_user: $gh_user, git_branch: $git_branch },
+      identity: { model: $model, gh_user: $gh_user, git_branch: $git_branch, git_repo: $git_repo, git_commit: $git_commit },
       astra: { agent_count: $astra_agents, division_count: $astra_divs, workflow_status: $workflow_status, event_count: $event_count, error_count: $error_count },
       rtk: { saved_today: $rtk_saved },
       freshness: {

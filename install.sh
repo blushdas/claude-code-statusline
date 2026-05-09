@@ -21,30 +21,24 @@ echo -e "${DIM}─────────────────────�
 echo ""
 
 # ── Check dependencies ──
-MISSING=()
-
 if ! command -v jq &>/dev/null; then
-  MISSING+=("jq")
+  echo -e "${RED}✗ jq is required but not installed.${NC}"
+  echo -e "  macOS: ${CYAN}brew install jq${NC}"
+  echo -e "  Linux: ${CYAN}apt install jq${NC}"
+  exit 1
 fi
+echo -e "${GREEN}✓${NC} jq found"
 
-if ! command -v gh &>/dev/null; then
-  MISSING+=("gh (GitHub CLI)")
-fi
-
-if [ ${#MISSING[@]} -gt 0 ]; then
-  echo -e "${YELLOW}Missing dependencies:${NC}"
-  for dep in "${MISSING[@]}"; do
-    echo -e "  ${RED}✗${NC} $dep"
+OPTIONAL_MISSING=()
+command -v gh       &>/dev/null || OPTIONAL_MISSING+=("gh (GitHub CLI) — @username display")
+command -v claudelytics &>/dev/null || OPTIONAL_MISSING+=("claudelytics — today/lifetime cost")
+command -v codeburn &>/dev/null || OPTIONAL_MISSING+=("codeburn — 7-day rolling cost + cache %")
+if [ ${#OPTIONAL_MISSING[@]} -gt 0 ]; then
+  echo ""
+  echo -e "${YELLOW}Optional tools not found (statusline works without them):${NC}"
+  for dep in "${OPTIONAL_MISSING[@]}"; do
+    echo -e "  ${DIM}·${NC} $dep"
   done
-  echo ""
-  echo -e "Install with: ${CYAN}brew install jq gh${NC} (macOS) or ${CYAN}apt install jq gh${NC} (Linux)"
-  echo ""
-  read -p "Continue anyway? (y/N) " -n 1 -r
-  echo ""
-  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Aborted."
-    exit 1
-  fi
 fi
 
 # ── Ensure ~/.claude exists ──
@@ -52,9 +46,12 @@ mkdir -p "$HOME/.claude"
 
 # ── Copy scripts ──
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p "$HOME/.claude/lib"
 cp "$SCRIPT_DIR/statusline.sh" "$HOME/.claude/statusline.sh"
 chmod +x "$HOME/.claude/statusline.sh"
-echo -e "${GREEN}✓${NC} Installed statusline.sh to ~/.claude/statusline.sh"
+cp "$SCRIPT_DIR/lib/compute.sh" "$HOME/.claude/lib/compute.sh"
+echo -e "${GREEN}✓${NC} Installed statusline.sh → ~/.claude/statusline.sh"
+echo -e "${GREEN}✓${NC} Installed lib/compute.sh → ~/.claude/lib/compute.sh"
 
 # ── Merge statusLine config into settings.json ──
 SETTINGS_FILE="$HOME/.claude/settings.json"

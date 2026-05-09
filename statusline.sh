@@ -195,10 +195,10 @@ if command -v codeburn &>/dev/null; then
   if cache_is_stale "$CB_CACHE" 300 && [ ! -f "$CB_LOCK" ]; then
     (
       touch "$CB_LOCK"
-      CB_JSON=$(codeburn status --period week --format menubar-json 2>/dev/null)
+      CB_JSON=$(codeburn report --period week --format json 2>/dev/null)
       if [ -n "$CB_JSON" ]; then
-        CB_C=$(echo "$CB_JSON" | jq -r '.current.cost // empty' 2>/dev/null)
-        CB_P=$(echo "$CB_JSON" | jq -r '.current.cacheHitPercent // empty' 2>/dev/null)
+        CB_C=$(echo "$CB_JSON" | jq -r '.overview.cost // empty' 2>/dev/null)
+        CB_P=$(echo "$CB_JSON" | jq -r '.overview.cacheHitPercent // empty' 2>/dev/null)
         [ -n "$CB_C" ] && printf "%s %s\n" "$CB_C" "${CB_P:-0}" > "$CB_CACHE"
       fi
       rm -f "$CB_LOCK"

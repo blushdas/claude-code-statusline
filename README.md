@@ -1,47 +1,30 @@
 # claude-code-statusline
 
-A real-time statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that tracks context usage, costs, and model discipline.
+Real-time statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Tracks context health, session cost, and model discipline — all in the status bar at the bottom of your terminal.
 
 ![claude-code-statusline screenshot](assets/statusline.png)
 
-## What It Shows
+## What you get
 
 ```
 ACT │ @user │ Sonnet 4.6 │ ████████░░░░░░ 67% │ ● ATTENTION
 GIT │ claude-code-statusline │ main │ a1b2c3d
 CTX │ 67.3k/200k │ $0.0031/1k │ 87% cache
 RUN │ $0.29 sesh │ $0.42/min
-SUM │ $118 today │ $291 key │ $2054 all │ ↓978k $2.93 rtk │ $460 wk │ 98%⚡
+SUM │ $118 today │ $291 key │ $2054 all │ ↓978k $2.93 rtk │ $466 wk │ 98%⚡
 ```
 
-When Opus is active without a Commander workflow, the model name flips to a red-background warning and a `OPUS-NO-CMDR` badge appears after the health indicator.
+**ACT** — GitHub username · model name · context bar + % · health status
 
-**ACT:** GitHub username · model name (Opus guard) · context bar · health status
+**GIT** — repo · branch · short commit (only shown inside a git repo)
 
-**GIT:** repo · branch · short commit, only when inside a git repo
+**CTX** — tokens used / context limit · cost per 1k tokens · session cache hit %
 
-**CTX:** tokens used/limit · cost per 1k tokens · cache hit rate, when available
+**RUN** — current session spend · live burn rate ($/min)
 
-**RUN:** current session spend · live burn rate
+**SUM** — today's spend · per-key month-to-date · lifetime total · optional: RTK savings · 7-day cost + cache hit %
 
-**SUM:** today · key month-to-date · lifetime · RTK savings · 7-day CodeBurn total + cache hit %, when available
-
-**OPS** (optional): Astra Agent SDK status: agent count · workflow state · event/error count
-
-## Features
-
-- **Context rot tracking** — visual progress bar with color-coded health warnings (5 tiers)
-- **Real-time cost** — per-1k-token rate, session total, and burn rate ($/min)
-- **Today's cost** — live daily spend pulled from claudelytics (cached 60s, background refresh)
-- **Key MTD** — per-key month-to-date cost tracked locally from Claude Code sessions
-- **Lifetime total** — cumulative spend across all sessions (from claudelytics)
-- **Opus guard** — red warning when Opus is active without a Commander workflow executing
-- **RTK integration** — today's token savings from RTK compression (optional, background refresh)
-- **CodeBurn integration** — 7-day rolling cost + cache hit % from CodeBurn (optional, cached 5 min)
-- **GitHub identity** — shows your `@username` from `gh` CLI
-- **Cost alerts** — `⚠ $X.XXXX BURN` at $3+ (red), `⚠ BURN` badge at $5+ (red background)
-
-## Quick Install
+## Install
 
 ```bash
 git clone https://github.com/blushdas/claude-code-statusline.git
@@ -49,23 +32,57 @@ cd claude-code-statusline
 bash install.sh
 ```
 
-The installer will:
-1. Copy `statusline.sh` to `~/.claude/statusline.sh`
-2. Add the `statusLine` config to `~/.claude/settings.json` (preserves existing settings)
-3. Optionally prompt for environment variables and launchd daemon
+Restart Claude Code. That's it.
 
-## Manual Setup
+**Only hard requirement: `jq`**
 
-### 1. Copy the script
+```bash
+brew install jq   # macOS
+apt install jq    # Linux
+```
+
+The installer checks for `jq` and will tell you if it's missing.
+
+## What works out of the box
+
+With just `jq` installed, you get the full ACT / GIT / CTX / RUN rows and the `$X key` segment in SUM (per-key MTD tracked locally). Everything else degrades gracefully — if an optional tool isn't installed, that segment is hidden. Nothing breaks.
+
+## Optional tools
+
+Each one adds a segment. Skip any you don't want.
+
+**`gh` (GitHub CLI)** — shows `@username` in ACT row. Without it: shows `local`.
+
+```bash
+brew install gh && gh auth login
+```
+
+**`claudelytics`** — adds `$X today` and `$X all` to SUM. Without it: those fields show `?`.
+
+```bash
+cargo install claudelytics
+```
+
+**`codeburn`** — adds `$X wk │ 98%⚡` (true 7-day rolling cost + cache hit %) to SUM. Without it: segment is hidden.
+
+```bash
+brew install codeburn
+```
+
+**`rtk` + `sqlite3`** — adds `↓Xk $Y.YY rtk` (today's token savings from RTK compression) to SUM. `sqlite3` ships with macOS. Install RTK from the [RTK repo](https://github.com/rusty-tools/rtk).
+
+## Manual setup
+
+If you'd rather not use the installer:
+
+**1. Copy the script**
 
 ```bash
 cp statusline.sh ~/.claude/statusline.sh
 chmod +x ~/.claude/statusline.sh
 ```
 
-### 2. Add to settings
-
-Add this to `~/.claude/settings.json`:
+**2. Add to `~/.claude/settings.json`**
 
 ```json
 {
@@ -76,124 +93,124 @@ Add this to `~/.claude/settings.json`:
 }
 ```
 
-### 3. Restart Claude Code
+If you already have a `settings.json`, merge just the `statusLine` key in — don't replace the file.
 
-The statusline appears at the bottom of your terminal.
+**3. Restart Claude Code**
 
 ## Configuration
 
-All configuration is via environment variables. Add these to your `.zshrc` / `.bashrc`:
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `ANTHROPIC_BILLING_START_DAY` | No | Day of month your billing cycle starts (default: 01) |
-| `CLAUDE_STATUSLINE_DEBUG` | No | Set to `1` for diagnostic logs at `~/.claude/.statusline_debug.log` |
-
-### Example `.zshrc`
+All config via environment variables. Add to `.zshrc` / `.bashrc`:
 
 ```bash
-# Claude Code Statusline
-export ANTHROPIC_BILLING_START_DAY="15"
+export ANTHROPIC_BILLING_START_DAY="15"  # billing cycle start day (default: 1)
+export CLAUDE_STATUSLINE_DEBUG="1"        # write debug logs to ~/.claude/.statusline_debug.log
 ```
 
-## Dependencies
-
-| Tool | Required | Purpose |
-|------|----------|---------|
-| `jq` | **Yes** | JSON parsing |
-| `gh` | Yes (soft) | GitHub username display |
-| `claudelytics` | No | Today's cost + lifetime total (background, cached 60s) |
-| `sqlite3` | No | RTK savings display (background, cached 5 min) |
-| `codeburn` | No | 7-day rolling cost + cache hit % (background, cached 5 min) |
-
-No `bc` required — all float math uses `awk`.
-
-## Context Rot Thresholds
+## Context rot thresholds
 
 Based on Claude Opus 4.6 Context Management Spec v1.0:
 
-| Threshold | Color | Status | Meaning |
-|-----------|-------|--------|---------|
-| 0–50% | 🟢 Green | `● healthy` | Normal operation |
-| 50–75% | 🟡 Yellow | `● ATTENTION` | Consider compacting soon |
-| 75–90% | 🟠 Orange | `● CHECKPOINT` | Start wrapping up |
-| 90–95% | 🔴 Red | `● CRITICAL` | Context degraded — compact now |
-| 95%+ | 🔴 Red bg | `◉◉ EMERGENCY` | Start new session immediately |
+- **0–50%** — green `● healthy`
+- **50–75%** — yellow `● ATTENTION` — consider compacting soon
+- **75–90%** — orange `● CHECKPOINT` — start wrapping up
+- **90–95%** — red `● CRITICAL` — compact now
+- **95%+** — red background `◉◉ EMERGENCY` — start a new session
 
-## Data Sources
+## Opus guard
 
-Each number in Row 2 comes from a different source:
+The statusline flags when Opus is active without a proper planning workflow, so you don't get a surprise bill from an unconstrained Opus session.
 
-| Display | Source | Freshness |
-|---------|--------|-----------|
-| `$/1k` | Claude Code JSON pipe | Real-time |
-| `tokens/limit` | Claude Code JSON pipe | Real-time |
-| `$ session` | Claude Code JSON pipe | Real-time |
-| `$/min` | Calculated from session cost + duration | Real-time |
-| `$ today` | claudelytics → JSONL files | 60s cache |
-| `$ key` | Local accumulator (`.cc_sessions.json`) | Per-tick |
-| `$ all` | claudelytics lifetime total | 60s cache |
-| `↓Xk rtk` | RTK SQLite DB | 5 min cache |
-| `$X wk` | CodeBurn (`codeburn status --period week`) | 5 min cache |
-| `XX%⚡` | CodeBurn 7-day cache hit % | 5 min cache |
+- **Opus + Commander workflow executing** → model name in bold magenta (intentional use)
+- **Opus + no workflow** → model name flips to `⚠ Opus X.X` on a red background + `OPUS-NO-CMDR` badge
 
-**Why do the numbers differ?** Each uses a different methodology:
-- **key** = sum of peak costs per session, tracked locally since statusline was installed (per-key MTD)
-- **today** = recalculated from token counts in JSONL files by claudelytics (most accurate for the day)
-- **all** = lifetime total across every transcript claudelytics has seen
+The guard reads `~/.astra/workflow/<session_id>.json`. If you don't use the Astra SDK, Opus will always trigger the warning — this is intentional behavior.
 
-## Persistent Files
+## Data sources
 
-All state is stored in `~/.claude/`:
+All real-time values come from the Claude Code JSON hook. Background values use a cache-and-refresh pattern (stale-while-revalidate) so the statusline never blocks.
 
-| File | Purpose | TTL |
-|------|---------|-----|
-| `.cc_sessions.json` | Peak cost per session (billing MTD) | Monthly reset |
-| `.cc_billing_month` | Current billing YYYYMM | Monthly |
-| `.gh_user_cache` | GitHub username | 60 min |
-| `.claudelytics_today_cache` | Today's cost from claudelytics | 60s |
-| `.claudelytics_total_cache` | Lifetime total from claudelytics | 60s |
-| `.rtk_today_cache` | RTK savings today | 5 min |
-| `.codeburn_week_cache` | CodeBurn 7-day cost + cache % | 5 min |
-| `.statusline_state.json` | Unified state snapshot (consumed by hooks) | Per-tick |
+- **context % / tokens** — Claude Code JSON hook, real-time
+- **session cost, burn rate** — Claude Code JSON hook, real-time
+- **cache hit %** — computed from hook token fields, session-scoped
+- **$X today** — claudelytics reads JSONL files, background refresh every 60s
+- **$X key** — local accumulator in `~/.claude/.cc_sessions.json`, resets each billing cycle
+- **$X all** — claudelytics lifetime total, background refresh every 60s
+- **↓Xk rtk** — RTK SQLite history DB, background refresh every 5 min
+- **$X wk / cache %** — `codeburn report --period week`, true 7-day rolling total, background refresh every 5 min
 
-## Opus Guard
+**Why do today / key / all show different numbers?** Each uses a different scope:
+- `key` = sessions tracked since statusline was installed, current billing cycle, per API key
+- `today` = recalculated from all JSONL transcripts claudelytics can see
+- `all` = lifetime total across every transcript claudelytics has ever seen
 
-The statusline flags Opus usage so you don't get a surprise bill.
+## Persistent files
 
-- **Opus + Commander workflow executing** → model name rendered in bold magenta (acceptable: Opus is doing planning/dispatch work)
-- **Opus + no Commander workflow** → model name flipped to white-on-red `⚠ Opus X.X ` and a red `OPUS-NO-CMDR` badge appears after the health indicator
+All in `~/.claude/` — never modify these manually while Claude Code is running.
 
-The guard checks for a workflow state file at `~/.astra/workflow/<session_id>.json` with `status: "executing"`. If that's not present, Opus usage is treated as undisciplined.
-
-Pair with a matching `UserPromptSubmit` hook to print an inline warning on every prompt.
+- `.cc_sessions.json` — peak cost per session (billing MTD accumulator)
+- `.cc_billing_month` — current billing period (YYYYMM)
+- `.gh_user_cache` — GitHub username (60 min TTL)
+- `.claudelytics_today_cache` — today's cost from claudelytics (60s TTL)
+- `.claudelytics_total_cache` — lifetime total from claudelytics (60s TTL)
+- `.rtk_today_cache` — RTK token savings today (5 min TTL)
+- `.codeburn_week_cache` — 7-day cost + cache hit % (5 min TTL)
+- `.statusline_state.json` — unified state snapshot for hooks and other tooling
 
 ## Troubleshooting
 
 **Statusline not showing?**
-- Make sure `~/.claude/settings.json` has the `statusLine` config
-- Restart Claude Code after making changes
+
+Check `~/.claude/settings.json` has the `statusLine` key and restart Claude Code.
 
 **`jq: command not found`**
-- Install jq: `brew install jq` (macOS) or `apt install jq` (Linux)
 
-**CC cost shows $0.00?**
-- Costs accumulate from Claude Code sessions as you use it
-- The counter resets each billing cycle (`ANTHROPIC_BILLING_START_DAY`)
-- Check current total: `jq '[.[]] | add // 0' ~/.claude/.cc_sessions.json`
-- Reset manually: `echo '{}' > ~/.claude/.cc_sessions.json`
+```bash
+brew install jq   # macOS
+apt install jq    # Linux
+```
 
-**Today cost shows `?`?**
-- Install claudelytics: `cargo install claudelytics`
-- On first run, the cache needs to populate — wait one tick after install
+**SUM shows `? today` or `? all`?**
 
-**RTK savings not showing?**
-- Install RTK and ensure it has tracked at least one command today
-- Check: `~/.local/bin/rtk gain --format json`
+```bash
+cargo install claudelytics
+```
+
+Wait one refresh cycle (60s) after install for the cache to populate.
+
+**Key MTD shows `$0`?**
+
+Normal on first run — the accumulator starts from zero and builds up across sessions. Check the current value:
+
+```bash
+jq '[.[]] | add // 0' ~/.claude/.cc_sessions.json
+```
+
+Reset manually (e.g. new billing cycle):
+
+```bash
+echo '{}' > ~/.claude/.cc_sessions.json
+```
+
+**RTK segment not showing?**
+
+RTK needs to have tracked at least one command today. Run `rtk gain` to confirm it's working.
 
 **GitHub username not showing?**
-- Make sure you're logged in: `gh auth status`
-- Cache refreshes every 60 minutes: `cat ~/.claude/.gh_user_cache`
+
+```bash
+gh auth status        # verify login
+cat ~/.claude/.gh_user_cache   # check cached value
+```
+
+Cache refreshes every 60 minutes. Delete the cache file to force an immediate refresh.
+
+**CodeBurn segment not showing?**
+
+```bash
+codeburn report --period week --format json   # verify it returns data
+```
+
+If the command works, the cache will populate on next statusline tick.
 
 ## License
 

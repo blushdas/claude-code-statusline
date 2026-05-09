@@ -2,24 +2,31 @@
 
 A real-time statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that tracks context usage, costs, and model discipline.
 
+![claude-code-statusline screenshot](assets/statusline.png)
+
 ## What It Shows
 
 ```
-@user | Sonnet 4.6 | ████████░░░░ 67% | ● ATTENTION
-$0.0031/1k · 67.3k/200k  $0.29 sesh · $0.42/min  $118 today · $291 key · $2054 all  ↓978k rtk
+ACT │ @user │ Sonnet 4.6 │ ████████░░░░░░ 67% │ ● ATTENTION
+GIT │ claude-code-statusline │ main │ a1b2c3d
+CTX │ 67.3k/200k │ $0.0031/1k │ 87% cache
+RUN │ $0.29 sesh │ $0.42/min
+SUM │ $118 today │ $291 key │ $2054 all │ ↓978k $2.93 rtk │ $460 wk │ 98%⚡
 ```
 
 When Opus is active without a Commander workflow, the model name flips to a red-background warning and a `OPUS-NO-CMDR` badge appears after the health indicator.
 
-**Row 1:** GitHub username · model name (Opus guard) · context bar · health status
+**ACT:** GitHub username · model name (Opus guard) · context bar · health status
 
-**Row 2** (grouped left-to-right, micro → macro):
-- **Rate:** `$/1k tokens · tokens used/limit` — efficiency at a glance
-- **Session:** `$ session · $/min burn rate` — what this session is costing
-- **Aggregates:** `$ today · $ key (month-to-date) · $ all (lifetime)` — bigger picture
-- **RTK savings:** `↓Xk rtk` — tokens saved today by RTK compression (optional, if RTK installed)
+**GIT:** repo · branch · short commit, only when inside a git repo
 
-**Row 3** (optional): Astra Agent SDK status — agent count, workflow state, error count
+**CTX:** tokens used/limit · cost per 1k tokens · cache hit rate, when available
+
+**RUN:** current session spend · live burn rate
+
+**SUM:** today · key month-to-date · lifetime · RTK savings · 7-day CodeBurn total + cache hit %, when available
+
+**OPS** (optional): Astra Agent SDK status: agent count · workflow state · event/error count
 
 ## Features
 
@@ -30,6 +37,7 @@ When Opus is active without a Commander workflow, the model name flips to a red-
 - **Lifetime total** — cumulative spend across all sessions (from claudelytics)
 - **Opus guard** — red warning when Opus is active without a Commander workflow executing
 - **RTK integration** — today's token savings from RTK compression (optional, background refresh)
+- **CodeBurn integration** — 7-day rolling cost + cache hit % from CodeBurn (optional, cached 5 min)
 - **GitHub identity** — shows your `@username` from `gh` CLI
 - **Cost alerts** — `⚠ $X.XXXX BURN` at $3+ (red), `⚠ BURN` badge at $5+ (red background)
 
@@ -96,6 +104,7 @@ export ANTHROPIC_BILLING_START_DAY="15"
 | `gh` | Yes (soft) | GitHub username display |
 | `claudelytics` | No | Today's cost + lifetime total (background, cached 60s) |
 | `sqlite3` | No | RTK savings display (background, cached 5 min) |
+| `codeburn` | No | 7-day rolling cost + cache hit % (background, cached 5 min) |
 
 No `bc` required — all float math uses `awk`.
 
@@ -125,6 +134,8 @@ Each number in Row 2 comes from a different source:
 | `$ key` | Local accumulator (`.cc_sessions.json`) | Per-tick |
 | `$ all` | claudelytics lifetime total | 60s cache |
 | `↓Xk rtk` | RTK SQLite DB | 5 min cache |
+| `$X wk` | CodeBurn (`codeburn status --period week`) | 5 min cache |
+| `XX%⚡` | CodeBurn 7-day cache hit % | 5 min cache |
 
 **Why do the numbers differ?** Each uses a different methodology:
 - **key** = sum of peak costs per session, tracked locally since statusline was installed (per-key MTD)
@@ -143,6 +154,7 @@ All state is stored in `~/.claude/`:
 | `.claudelytics_today_cache` | Today's cost from claudelytics | 60s |
 | `.claudelytics_total_cache` | Lifetime total from claudelytics | 60s |
 | `.rtk_today_cache` | RTK savings today | 5 min |
+| `.codeburn_week_cache` | CodeBurn 7-day cost + cache % | 5 min |
 | `.statusline_state.json` | Unified state snapshot (consumed by hooks) | Per-tick |
 
 ## Opus Guard

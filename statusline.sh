@@ -180,6 +180,32 @@ if [ -f "$RTK_DB" ] && command -v sqlite3 &>/dev/null; then
   fi
 fi
 
+# ── CodeBurn 7-day cost + cache hit % (cached 5 min, background refresh) ──
+CB_CACHE="$HOME/.claude/.codeburn_week_cache"
+CB_LOCK="$HOME/.claude/.codeburn_refreshing"
+CB_COST7D=""
+CB_CACHE_PCT7D=""
+if [ -f "$CB_CACHE" ]; then
+  CB_COST7D=$(awk 'NR==1{print $1}' "$CB_CACHE" 2>/dev/null)
+  CB_CACHE_PCT7D=$(awk 'NR==1{print $2}' "$CB_CACHE" 2>/dev/null)
+fi
+
+if command -v codeburn &>/dev/null; then
+  [ -f "$CB_LOCK" ] && cache_is_stale "$CB_LOCK" 120 && rm -f "$CB_LOCK"
+  if cache_is_stale "$CB_CACHE" 300 && [ ! -f "$CB_LOCK" ]; then
+    (
+      touch "$CB_LOCK"
+      CB_JSON=$(codeburn status --period week --format menubar-json 2>/dev/null)
+      if [ -n "$CB_JSON" ]; then
+        CB_C=$(echo "$CB_JSON" | jq -r '.current.cost // empty' 2>/dev/null)
+        CB_P=$(echo "$CB_JSON" | jq -r '.current.cacheHitPercent // empty' 2>/dev/null)
+        [ -n "$CB_C" ] && printf "%s %s\n" "$CB_C" "${CB_P:-0}" > "$CB_CACHE"
+      fi
+      rm -f "$CB_LOCK"
+    ) &
+  fi
+fi
+
 # ── Build colored context progress bar ──
 BAR_WIDTH=14
 FILLED=$(bar_filled "$PCT" "$BAR_WIDTH")
@@ -196,10 +222,11 @@ BAR="${BAR_COLOR}${FILLED_STR}${RESET}${DIM}${EMPTY_STR}${RESET}"
 
 # ── Context rot status (Claude Opus 4.6 Context Management Spec v1.0) ──
 STATUS_TEXT=$(status_label "$PCT")
+STATUS_TEXT_DISPLAY=$(printf "%s" "$STATUS_TEXT" | tr '[:lower:]' '[:upper:]')
 if [ "$PCT" -ge 95 ]; then
-  STATUS="${BAR_COLOR}◉◉ ${STATUS_TEXT}${RESET}"
+  STATUS="${BAR_COLOR}◉◉ ${STATUS_TEXT_DISPLAY}${RESET}"
 else
-  STATUS="${BAR_COLOR}● ${STATUS_TEXT}${RESET}"
+  STATUS="${BAR_COLOR}● ${STATUS_TEXT_DISPLAY}${RESET}"
 fi
 
 # ── GitHub prefix (dimmed — reference info, not actionable) ──
@@ -226,6 +253,22 @@ if [ -n "$RTK_RAW" ] && [ "$RTK_RAW" -gt 0 ] 2>/dev/null; then
   RTK_FMT=$(rtk_format "$RTK_RAW")
   RTK_DOLLARS=$(rtk_dollars "$RTK_RAW")
   RTK_SEGMENT="${GREEN}↓${RTK_FMT} ${RTK_DOLLARS}${RTK_STALE_MARKER}${RESET} ${DIM}rtk${RESET}"
+fi
+
+# ── CodeBurn segment (7d cost + cache hit %, only if data available) ──
+CB_SEGMENT=""
+CB_STALE=$(stale_marker "$CB_CACHE" 300)
+if [ -n "$CB_COST7D" ] && [ -n "$CB_CACHE_PCT7D" ]; then
+  CB_COST_FMT=$(awk -v c="$CB_COST7D" 'BEGIN { if (c+0 >= 10) printf "$%.0f", c+0; else printf "$%.1f", c+0 }')
+  CB_PCT_INT=$(printf "%.0f" "$CB_CACHE_PCT7D" 2>/dev/null)
+  if [ "${CB_PCT_INT:-0}" -ge 85 ] 2>/dev/null; then
+    CB_PCT_COLOR="$CYAN"
+  elif [ "${CB_PCT_INT:-0}" -ge 70 ] 2>/dev/null; then
+    CB_PCT_COLOR="$YELLOW"
+  else
+    CB_PCT_COLOR="\033[38;5;208m"
+  fi
+  CB_SEGMENT="${WHITE}${CB_COST_FMT}${CB_STALE}${RESET} ${DIM}wk${RESET} ${SEP} ${CB_PCT_COLOR}${CB_PCT_INT}%${RESET}${DIM}⚡${RESET}"
 fi
 
 # ── Staleness markers for cache-backed fields ──
@@ -256,41 +299,50 @@ case "$MODEL" in
     ;;
 esac
 
-# ── Git info row (repo │ branch │ commit — dim, only if inside a repo) ──
+# ── Presentation rows ──
+SEP="${DIM}│${RESET}"
+ROW_LABEL="\033[38;5;245m"
+PCT_DISPLAY="${PCT}%"
+
+# Git info row (repo │ branch │ commit — dim, only if inside a repo)
 GIT_ROW=""
 if [ -n "$GIT_REPO" ] || [ -n "$GIT_BRANCH" ]; then
-  GIT_ROW="  ${DIM}${GIT_REPO}${RESET}"
-  [ -n "$GIT_BRANCH" ] && GIT_ROW="${GIT_ROW} ${DIM}│${RESET} ${DIM}${GIT_BRANCH}${RESET}"
-  [ -n "$GIT_COMMIT" ] && GIT_ROW="${GIT_ROW} ${DIM}│${RESET} ${DIM}${GIT_COMMIT}${RESET}"
+  GIT_ROW="${ROW_LABEL}GIT${RESET} ${SEP} ${DIM}${GIT_REPO:-repo}${RESET}"
+  [ -n "$GIT_BRANCH" ] && GIT_ROW="${GIT_ROW} ${SEP} ${DIM}${GIT_BRANCH}${RESET}"
+  [ -n "$GIT_COMMIT" ] && GIT_ROW="${GIT_ROW} ${SEP} ${DIM}${GIT_COMMIT}${RESET}"
 fi
 
-ROW1="${GH_PREFIX} ${DIM}│${RESET} ${MODEL_SEGMENT} ${DIM}│${RESET} ${BAR} ${BAR_COLOR}${PCT}%%${RESET} ${DIM}│${RESET} ${STATUS}${OPUS_BADGE}"
-[ -z "$GH_USER" ] && ROW1="${MODEL_SEGMENT} ${DIM}│${RESET} ${BAR} ${BAR_COLOR}${PCT}%%${RESET} ${DIM}│${RESET} ${STATUS}${OPUS_BADGE}"
+IDENTITY_SEGMENT="${GH_PREFIX}"
+[ -z "$IDENTITY_SEGMENT" ] && IDENTITY_SEGMENT="${DIM}local${RESET}"
+ROW1="${ROW_LABEL}ACT${RESET} ${SEP} ${IDENTITY_SEGMENT} ${SEP} ${MODEL_SEGMENT} ${SEP} ${BAR} ${BAR_COLOR}${PCT_DISPLAY}${RESET} ${SEP} ${STATUS}${OPUS_BADGE}"
 
-# ── Cache hit segment (cyan, only if >0%; %% for printf safety) ──
+# Cache hit segment (cyan, only if >0%)
 CACHE_SEGMENT=""
-[ -n "$CACHE_HIT_PCT" ] && CACHE_SEGMENT=" ${DIM}·${RESET} ${CYAN}${CACHE_HIT_PCT}%%${RESET} ${DIM}cache${RESET}"
+[ -n "$CACHE_HIT_PCT" ] && CACHE_SEGMENT=" ${SEP} ${CYAN}${CACHE_HIT_PCT}%${RESET} ${DIM}cache${RESET}"
 
-ROW2="  ${DIM}\$${COST_PER_1K}/1k · ${TOKEN_DISPLAY}/${CTX_LIMIT_K}${RESET}${CACHE_SEGMENT}"
-ROW2="${ROW2}  ${DIM}─${RESET}  ${WHITE}\$${SESSION_COST_SHORT}${RESET} ${DIM}sesh${RESET} ${DIM}·${RESET} ${DIM}\$${BURN_RATE}/min${RESET}"
+ROW2="${ROW_LABEL}CTX${RESET} ${SEP} ${DIM}${TOKEN_DISPLAY}/${CTX_LIMIT_K}${RESET} ${SEP} ${DIM}\$${COST_PER_1K}/1k${RESET}${CACHE_SEGMENT}"
+BURN_RATE_SEGMENT="${DIM}\$${BURN_RATE}/min${RESET}"
+[ "$BURN_RATE" = "-.--" ] && BURN_RATE_SEGMENT="${DIM}idle${RESET}"
+ROW3="${ROW_LABEL}RUN${RESET} ${SEP} ${WHITE}\$${SESSION_COST_SHORT}${RESET} ${DIM}sesh${RESET} ${SEP} ${BURN_RATE_SEGMENT}"
 
-ROW3="  ${CYAN}\$${TODAY_COST}${TODAY_STALE}${RESET} ${DIM}today${RESET} ${DIM}·${RESET} ${YELLOW}\$${CC_MTD_INT}${RESET} ${DIM}key${RESET} ${DIM}·${RESET} ${DIM}\$${CLYTICS_TOTAL}${TODAY_STALE}${RESET} ${DIM}all${RESET}"
+ROW4="${ROW_LABEL}SUM${RESET} ${SEP} ${CYAN}\$${TODAY_COST}${TODAY_STALE}${RESET} ${DIM}today${RESET} ${SEP} ${YELLOW}\$${CC_MTD_INT}${RESET} ${DIM}key${RESET} ${SEP} ${DIM}\$${CLYTICS_TOTAL}${TODAY_STALE}${RESET} ${DIM}all${RESET}"
 if [ -n "$RTK_SEGMENT" ] || [ -n "$COST_ALERT" ]; then
-  ROW3="${ROW3}  ${DIM}─${RESET}  ${RTK_SEGMENT}${COST_ALERT}"
+  ROW4="${ROW4} ${SEP} ${RTK_SEGMENT}${COST_ALERT}"
 fi
+[ -n "$CB_SEGMENT" ] && ROW4="${ROW4} ${SEP} ${CB_SEGMENT}"
 
-printf "${ROW1}\n"
-[ -n "$GIT_ROW" ] && printf "${GIT_ROW}\n"
-printf "${ROW2}\n${ROW3}\n"
+printf "%b\n" "$ROW1"
+[ -n "$GIT_ROW" ] && printf "%b\n" "$GIT_ROW"
+printf "%b\n%b\n%b\n" "$ROW2" "$ROW3" "$ROW4"
 
-# ── Astra Agent SDK row (ROW3) ──
+# ── Astra Agent SDK row ──
 ASTRA_ROW=""
 
 # Registry summary
 if [ -f "$ASTRA_DIR/registry.json" ]; then
   ASTRA_AGENTS=$(jq -r '.agentCount // ""' "$ASTRA_DIR/registry.json" 2>/dev/null)
   ASTRA_DIVS=$(jq -r '.divisionCount // ""' "$ASTRA_DIR/registry.json" 2>/dev/null)
-  [ -n "$ASTRA_AGENTS" ] && ASTRA_ROW="  ${DIM}⬡ ${ASTRA_AGENTS} agents/${ASTRA_DIVS} div${RESET}"
+  [ -n "$ASTRA_AGENTS" ] && ASTRA_ROW="${ROW_LABEL}OPS${RESET} ${SEP} ${DIM}⬡ ${ASTRA_AGENTS} agents/${ASTRA_DIVS} div${RESET}"
 fi
 
 # Workflow state
@@ -309,7 +361,8 @@ if [ -n "$SESSION_ID" ] && [ -f "$ASTRA_DIR/workflow/${SESSION_ID}.json" ]; then
       *)          WF_COLOR="\033[2m" ;;
     esac
     WF_SEGMENT="${WF_COLOR}◆ ${WORKFLOW_STATUS}${PHASE_LABEL}${RESET}"
-    ASTRA_ROW="${ASTRA_ROW}  ${DIM}─${RESET}  ${WF_SEGMENT}"
+    [ -z "$ASTRA_ROW" ] && ASTRA_ROW="${ROW_LABEL}OPS${RESET}"
+    ASTRA_ROW="${ASTRA_ROW} ${SEP} ${WF_SEGMENT}"
   fi
 fi
 
@@ -321,12 +374,13 @@ if [ -f "$EVENTS_FILE" ]; then
   ERROR_COUNT="${ERROR_COUNT:-0}"
   EVENT_COUNT=$(wc -l < "$EVENTS_FILE" 2>/dev/null | tr -d '[:space:]')
   EVENT_COUNT="${EVENT_COUNT:-0}"
+  [ -z "$ASTRA_ROW" ] && ASTRA_ROW="${ROW_LABEL}OPS${RESET}"
   [ "$ERROR_COUNT" -gt 0 ] \
-    && ASTRA_ROW="${ASTRA_ROW}  ${DIM}─${RESET}  \033[31m✗ ${ERROR_COUNT} err${RESET}" \
-    || ASTRA_ROW="${ASTRA_ROW}  ${DIM}─${RESET}  ${DIM}${EVENT_COUNT} events${RESET}"
+    && ASTRA_ROW="${ASTRA_ROW} ${SEP} \033[31m✗ ${ERROR_COUNT} err${RESET}" \
+    || ASTRA_ROW="${ASTRA_ROW} ${SEP} ${DIM}${EVENT_COUNT} events${RESET}"
 fi
 
-[ -n "$ASTRA_ROW" ] && printf "${ASTRA_ROW}\n"
+[ -n "$ASTRA_ROW" ] && printf "%b\n" "$ASTRA_ROW"
 
 # ── Unified state file (single truth for all consumers) ──
 STATE_FILE="$HOME/.claude/.statusline_state.json"
@@ -360,6 +414,9 @@ if command -v jq &>/dev/null; then
     --arg git_branch "${GIT_BRANCH:-}" \
     --arg git_repo "${GIT_REPO:-}" \
     --arg git_commit "${GIT_COMMIT:-}" \
+    --arg cb_cost7d "${CB_COST7D:-}" \
+    --arg cb_cache_pct7d "${CB_CACHE_PCT7D:-}" \
+    --argjson cb_age "$(cache_age "$CB_CACHE")" \
     '{
       version: 1,
       timestamp: $ts,
@@ -369,10 +426,12 @@ if command -v jq &>/dev/null; then
       identity: { model: $model, gh_user: $gh_user, git_branch: $git_branch, git_repo: $git_repo, git_commit: $git_commit },
       astra: { agent_count: $astra_agents, division_count: $astra_divs, workflow_status: $workflow_status, event_count: $event_count, error_count: $error_count },
       rtk: { saved_today: $rtk_saved },
+      codeburn: { cost7d: $cb_cost7d, cache_hit_pct7d: $cb_cache_pct7d },
       freshness: {
         gh_user:    { age_s: $gh_age,    max_s: 3600, fresh: ($gh_age < 3600) },
         today_cost: { age_s: $today_age, max_s: 60,   fresh: ($today_age < 60) },
-        rtk_saved:  { age_s: $rtk_age,   max_s: 300,  fresh: ($rtk_age < 300) }
+        rtk_saved:  { age_s: $rtk_age,   max_s: 300,  fresh: ($rtk_age < 300) },
+        codeburn:   { age_s: $cb_age,    max_s: 300,  fresh: ($cb_age < 300) }
       }
     }' > "$STATE_FILE" 2>/dev/null
 fi
